@@ -26,9 +26,11 @@ coverage/
 
 # Logs and runtime output
 *.log
+backend/*_log.csv
+backend/*_state.json
+backend/bt_result.txt
 
 # OS / editor
 .DS_Store
 Thumbs.db
 .vscode/
-
