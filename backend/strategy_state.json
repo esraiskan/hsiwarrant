@@ -1,0 +1,20 @@
+{
+  "position": "none",
+  "entry_price": 0.0,
+  "current_price": 25898.61,
+  "total_pnl_hkd": 500.00000000000045,
+  "trade_count": 2,
+  "win_count": 2,
+  "loss_count": 0,
+  "current_warrant_code": "",
+  "pending_entry_side": "none",
+  "pending_buy_order_id": "",
+  "exit_order_id": "",
+  "entry_order_time": "",
+  "entry_chase_count": 0,
+  "warrant_entry_price": 0.0,
+  "warrant_exit_price": 0.0,
+  "warrant_tick_size": 0.0,
+  "warrant_qty": 0.0,
+  "stop_loss_order_sent": false
+}
