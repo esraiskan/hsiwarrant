@@ -67,6 +67,7 @@ TERMINAL_UNFILLED_EXIT_STATUSES = {
     "DELETED",
     "DISABLED",
 }
+EXTREME_STOP_REVERSAL_GUARD_SECONDS = 5 * 60
 
 
 class HSIStrategyEngine:
@@ -99,6 +100,10 @@ class HSIStrategyEngine:
         self.warrant_qty = 0.0
         self.stop_loss_order_sent = False
         self.entry_mode = ""
+        self.last_extreme_stop_mode = ""
+        self.last_extreme_stop_position = PositionType.NONE
+        self.last_extreme_stop_time: datetime | None = None
+        self.last_reversal_guard_log_key = ""
 
         # 回调
         self.on_kline_update: Optional[Callable] = None
@@ -288,6 +293,10 @@ class HSIStrategyEngine:
             "warrant_qty": self.warrant_qty,
             "stop_loss_order_sent": self.stop_loss_order_sent,
             "entry_mode": self.entry_mode,
+            "last_extreme_stop_mode": self.last_extreme_stop_mode,
+            "last_extreme_stop_position": self.last_extreme_stop_position.value,
+            "last_extreme_stop_time": self.last_extreme_stop_time.isoformat() if self.last_extreme_stop_time else "",
+            "last_reversal_guard_log_key": self.last_reversal_guard_log_key,
         }
 
     def _save_runtime_state(self):
@@ -319,6 +328,13 @@ class HSIStrategyEngine:
             self.warrant_qty = float(data.get("warrant_qty", 0.0))
             self.stop_loss_order_sent = bool(data.get("stop_loss_order_sent", False))
             self.entry_mode = str(data.get("entry_mode", ""))
+            self.last_extreme_stop_mode = str(data.get("last_extreme_stop_mode", ""))
+            self.last_extreme_stop_position = PositionType(
+                data.get("last_extreme_stop_position", PositionType.NONE.value)
+            )
+            last_stop_time = data.get("last_extreme_stop_time")
+            self.last_extreme_stop_time = datetime.fromisoformat(last_stop_time) if last_stop_time else None
+            self.last_reversal_guard_log_key = str(data.get("last_reversal_guard_log_key", ""))
             if self.position != PositionType.NONE and (
                 not self.current_warrant_code or not self.exit_order_id or self.warrant_entry_price <= 0
             ):
@@ -404,12 +420,15 @@ class HSIStrategyEngine:
     def _apply_exit_fill_to_state(self, order: dict):
         exit_avg = order["dealt_avg_price"] or self.warrant_exit_price
         pnl_hkd = (exit_avg - self.warrant_entry_price) * order["dealt_qty"]
+        old_position = self.position
+        old_entry_mode = self.entry_mode
         self.total_pnl_hkd += pnl_hkd
         if pnl_hkd >= 0:
             self.win_count += 1
         else:
             self.loss_count += 1
         self.trade_count = max(self.trade_count, self.win_count + self.loss_count)
+        self._update_extreme_stop_reversal_guard(old_entry_mode, old_position, pnl_hkd)
         self.position = PositionType.NONE
         self.entry_price = 0.0
         self._reset_order_state()
@@ -448,6 +467,82 @@ class HSIStrategyEngine:
         self.warrant_qty = 0.0
         self.stop_loss_order_sent = False
         self.entry_mode = ""
+
+    def _reset_extreme_stop_reversal_guard(self):
+        self.last_extreme_stop_mode = ""
+        self.last_extreme_stop_position = PositionType.NONE
+        self.last_extreme_stop_time = None
+        self.last_reversal_guard_log_key = ""
+
+    def _update_extreme_stop_reversal_guard(
+        self,
+        entry_mode: str,
+        position: PositionType,
+        pnl_hkd: float,
+    ):
+        if pnl_hkd < 0 and entry_mode in EXTREME_ENTRY_MODES:
+            self.last_extreme_stop_mode = entry_mode
+            self.last_extreme_stop_position = position
+            self.last_extreme_stop_time = datetime.now()
+            self.last_reversal_guard_log_key = ""
+
+    def _is_blocked_by_extreme_stop_reversal_guard(
+        self,
+        direction: str,
+        current_time: str,
+    ) -> tuple[bool, int]:
+        if not self.last_extreme_stop_time:
+            return False, 0
+
+        try:
+            now = datetime.strptime(current_time, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            now = datetime.now()
+        elapsed = max((now - self.last_extreme_stop_time).total_seconds(), 0)
+        remaining = max(int(EXTREME_STOP_REVERSAL_GUARD_SECONDS - elapsed), 0)
+        if remaining <= 0:
+            return False, 0
+
+        if (
+            direction == "bull"
+            and self.last_extreme_stop_mode == "极度超买"
+            and self.last_extreme_stop_position == PositionType.BEAR
+        ):
+            return True, remaining
+        if (
+            direction == "bear"
+            and self.last_extreme_stop_mode == "极度超卖"
+            and self.last_extreme_stop_position == PositionType.BULL
+        ):
+            return True, remaining
+        return False, 0
+
+    async def _emit_reversal_guard_skip(
+        self,
+        current_time: str,
+        hsi_price: float,
+        rsi: float,
+        direction: str,
+        remaining_seconds: int,
+    ):
+        minute_key = current_time[:16] if len(current_time) >= 16 else current_time
+        log_key = f"{minute_key}:{direction}"
+        if self.last_reversal_guard_log_key == log_key:
+            return
+        self.last_reversal_guard_log_key = log_key
+        self._save_runtime_state()
+        remaining_minutes = max(1, math.ceil(remaining_seconds / 60))
+        await self._emit_trade_record(TradeRecord(
+            time=current_time,
+            signal=TradeSignal.HOLD,
+            price=hsi_price,
+            rsi=round(rsi, 2),
+            position=PositionType.NONE,
+            message=(
+                f"跳过累积趋势反手: {self.last_extreme_stop_mode}止损后 "
+                f"5分钟保护中 | direction:{direction} | remaining:{remaining_minutes}m"
+            ),
+        ))
 
     def _is_after_entry_cutoff(self, current_time: str) -> bool:
         time_part = current_time[11:16] if len(current_time) >= 16 else current_time[:5]
@@ -1155,6 +1250,14 @@ class HSIStrategyEngine:
                         if skip_reasons:
                             print(f"  >>> Skip bear cumtrend: {'; '.join(skip_reasons)}")
                         else:
+                            blocked, remaining = self._is_blocked_by_extreme_stop_reversal_guard(
+                                "bear", current_time
+                            )
+                            if blocked:
+                                await self._emit_reversal_guard_skip(
+                                    current_time, price, rsi, "bear", remaining
+                                )
+                                return
                             ratio = breadth_ratio
                             await self._submit_entry_order(
                                 PositionType.BEAR, price, rsi, current_time, "累积趋势",
@@ -1169,6 +1272,14 @@ class HSIStrategyEngine:
                         if skip_reasons:
                             print(f"  >>> Skip bull cumtrend: {'; '.join(skip_reasons)}")
                         else:
+                            blocked, remaining = self._is_blocked_by_extreme_stop_reversal_guard(
+                                "bull", current_time
+                            )
+                            if blocked:
+                                await self._emit_reversal_guard_skip(
+                                    current_time, price, rsi, "bull", remaining
+                                )
+                                return
                             ratio = breadth_ratio
                             await self._submit_entry_order(
                                 PositionType.BULL, price, rsi, current_time, "累积趋势",
@@ -1248,4 +1359,5 @@ class HSIStrategyEngine:
         self._last_vwap = None
         self._last_vwap_slope = None
         self._last_vol_ma = None
+        self._reset_extreme_stop_reversal_guard()
         self._save_runtime_state()
