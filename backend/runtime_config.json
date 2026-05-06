@@ -1,0 +1,12 @@
+{
+  "er_ratio": 10000,
+  "share_count": 100000,
+  "target_pnl": 200,
+  "extreme_stop_pnl": 500,
+  "bull_warrant_code": "HK.53114",
+  "bear_warrant_code": "HK.68529",
+  "rsi_oversold": 22,
+  "rsi_overbought": 76,
+  "poll_interval": 3,
+  "entry_order_wait_seconds": 40
+}

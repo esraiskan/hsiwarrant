@@ -60,6 +60,8 @@ export interface StrategyConfig {
   share_count: number;
   target_pnl: number;
   stop_points: number;
+  extreme_stop_pnl: number;
+  extreme_stop_points: number;
   bull_warrant_code: string;
   bull_warrant_name: string;
   bear_warrant_code: string;

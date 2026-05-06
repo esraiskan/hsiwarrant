@@ -124,6 +124,8 @@ async def get_config():
         share_count=engine.share_count,
         target_pnl=engine.target_pnl,
         stop_points=engine.stop_points,
+        extreme_stop_pnl=engine.extreme_stop_pnl,
+        extreme_stop_points=round(engine._extreme_stop_points(), 2),
         bull_warrant_code=engine.bull_warrant_code,
         bull_warrant_name=bull_name,
         bear_warrant_code=engine.bear_warrant_code,
@@ -140,7 +142,11 @@ async def get_config():
 @app.put("/api/config")
 async def update_config(config: ConfigUpdate):
     engine.update_config(**config.model_dump(exclude_none=True))
-    return {"message": "配置已更新", "stop_points": engine.stop_points}
+    return {
+        "message": "配置已更新",
+        "stop_points": engine.stop_points,
+        "extreme_stop_points": round(engine._extreme_stop_points(), 2),
+    }
 
 
 @app.get("/api/state")

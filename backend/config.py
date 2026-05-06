@@ -8,6 +8,7 @@ ER_RATIO = 10000  # 牛熊证换股比率
 SHARE_COUNT = 100000  # 每次开仓数量 (10万份)
 TARGET_PNL = 500  # 目标盈亏上限/下限 (500港元)
 STOP_POINTS = (TARGET_PNL * ER_RATIO) / SHARE_COUNT  # 50点
+EXTREME_STOP_PNL = 500  # 极度超买/超卖入场专用止损金额 (港元)
 BULL_WARRANT_CODE = ""  # 牛证 number，例如 "61234" 或 "HK.61234"
 BEAR_WARRANT_CODE = ""  # 熊证 number，例如 "61234" 或 "HK.61234"
 

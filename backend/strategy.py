@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from config import (
-    SYMBOL, ER_RATIO, SHARE_COUNT, TARGET_PNL, STOP_POINTS,
+    SYMBOL, ER_RATIO, SHARE_COUNT, TARGET_PNL, STOP_POINTS, EXTREME_STOP_PNL,
     BULL_WARRANT_CODE, BEAR_WARRANT_CODE,
     RSI_OVERSOLD, RSI_OVERBOUGHT, POLL_INTERVAL, ENTRY_ORDER_WAIT_SECONDS,
     ENTRY_CUTOFF_TIME,
@@ -21,6 +21,7 @@ from models import (
 )
 from futu_data import FutuDataSource
 from futu_trader import FutuTrader
+from runtime_config_store import load_runtime_config, save_runtime_config
 from strategy_state_store import load_strategy_state, save_strategy_state
 from trade_log_store import append_trade_log, load_trade_log
 from momentum_filter import get_momentum_filter_reasons
@@ -57,6 +58,17 @@ def _order_status_name(status: str) -> str:
     return str(status or "").upper().split(".")[-1]
 
 
+EXTREME_ENTRY_MODES = {"极度超卖", "极度超买"}
+TERMINAL_UNFILLED_EXIT_STATUSES = {
+    "CANCELLED_ALL",
+    "CANCELLED_PART",
+    "FAILED",
+    "SUBMIT_FAILED",
+    "DELETED",
+    "DISABLED",
+}
+
+
 class HSIStrategyEngine:
 
     def __init__(self):
@@ -86,6 +98,7 @@ class HSIStrategyEngine:
         self.warrant_tick_size = 0.0
         self.warrant_qty = 0.0
         self.stop_loss_order_sent = False
+        self.entry_mode = ""
 
         # 回调
         self.on_kline_update: Optional[Callable] = None
@@ -107,6 +120,7 @@ class HSIStrategyEngine:
         self.er_ratio = ER_RATIO
         self.share_count = SHARE_COUNT
         self.target_pnl = TARGET_PNL
+        self.extreme_stop_pnl = EXTREME_STOP_PNL
         self.stop_points = STOP_POINTS
         self.rsi_oversold = RSI_OVERSOLD
         self.rsi_overbought = RSI_OVERBOUGHT
@@ -115,6 +129,7 @@ class HSIStrategyEngine:
         self.entry_cutoff_time = ENTRY_CUTOFF_TIME
         self.bull_warrant_code = BULL_WARRANT_CODE
         self.bear_warrant_code = BEAR_WARRANT_CODE
+        self._load_runtime_config()
         self._load_runtime_state()
 
     def get_state(self, sync_exit: bool = True) -> StrategyState:
@@ -170,7 +185,80 @@ class HSIStrategyEngine:
                 else:
                     setattr(self, key, value)
         if "target_pnl" in kwargs or "er_ratio" in kwargs or "share_count" in kwargs:
-            self.stop_points = (self.target_pnl * self.er_ratio) / self.share_count
+            self.stop_points = self._stop_points_for_pnl(self.target_pnl)
+        self._save_runtime_config()
+
+    def _stop_points_for_pnl(self, pnl_hkd: float) -> float:
+        if self.share_count <= 0:
+            return 0.0
+        return (float(pnl_hkd) * self.er_ratio) / self.share_count
+
+    def _extreme_stop_points(self) -> float:
+        return self._stop_points_for_pnl(self.extreme_stop_pnl)
+
+    def _active_stop_pnl(self) -> float:
+        return self.extreme_stop_pnl if self.entry_mode in EXTREME_ENTRY_MODES else self.target_pnl
+
+    def _active_stop_points(self) -> float:
+        return self._stop_points_for_pnl(self._active_stop_pnl())
+
+    def _runtime_config_payload(self) -> dict:
+        return {
+            "er_ratio": self.er_ratio,
+            "share_count": self.share_count,
+            "target_pnl": self.target_pnl,
+            "extreme_stop_pnl": self.extreme_stop_pnl,
+            "bull_warrant_code": self.bull_warrant_code,
+            "bear_warrant_code": self.bear_warrant_code,
+            "rsi_oversold": self.rsi_oversold,
+            "rsi_overbought": self.rsi_overbought,
+            "poll_interval": self.poll_interval,
+            "entry_order_wait_seconds": self.entry_order_wait_seconds,
+        }
+
+    def _save_runtime_config(self):
+        save_runtime_config(self._runtime_config_payload())
+
+    def _load_runtime_config(self):
+        data = load_runtime_config()
+        if not data:
+            self.stop_points = self._stop_points_for_pnl(self.target_pnl)
+            return
+        int_fields = {
+            "er_ratio",
+            "share_count",
+            "target_pnl",
+            "extreme_stop_pnl",
+            "rsi_oversold",
+            "rsi_overbought",
+            "poll_interval",
+            "entry_order_wait_seconds",
+        }
+        try:
+            for key in int_fields:
+                if key not in data:
+                    continue
+                value = int(data[key])
+                if value <= 0:
+                    raise ValueError(f"{key} 必须大于 0")
+                setattr(self, key, value)
+            for key in ("bull_warrant_code", "bear_warrant_code"):
+                if key in data:
+                    setattr(self, key, normalize_warrant_code(data.get(key)))
+            self.stop_points = self._stop_points_for_pnl(self.target_pnl)
+        except Exception as e:
+            print(f"[RuntimeConfig] 配置内容无效，使用默认配置: {e}")
+            self.er_ratio = ER_RATIO
+            self.share_count = SHARE_COUNT
+            self.target_pnl = TARGET_PNL
+            self.extreme_stop_pnl = EXTREME_STOP_PNL
+            self.stop_points = self._stop_points_for_pnl(self.target_pnl)
+            self.rsi_oversold = RSI_OVERSOLD
+            self.rsi_overbought = RSI_OVERBOUGHT
+            self.poll_interval = POLL_INTERVAL
+            self.entry_order_wait_seconds = ENTRY_ORDER_WAIT_SECONDS
+            self.bull_warrant_code = BULL_WARRANT_CODE
+            self.bear_warrant_code = BEAR_WARRANT_CODE
 
     async def _emit_trade_record(self, record: TradeRecord):
         append_trade_log(record)
@@ -199,6 +287,7 @@ class HSIStrategyEngine:
             "warrant_tick_size": self.warrant_tick_size,
             "warrant_qty": self.warrant_qty,
             "stop_loss_order_sent": self.stop_loss_order_sent,
+            "entry_mode": self.entry_mode,
         }
 
     def _save_runtime_state(self):
@@ -229,6 +318,7 @@ class HSIStrategyEngine:
             self.warrant_tick_size = float(data.get("warrant_tick_size", 0.0))
             self.warrant_qty = float(data.get("warrant_qty", 0.0))
             self.stop_loss_order_sent = bool(data.get("stop_loss_order_sent", False))
+            self.entry_mode = str(data.get("entry_mode", ""))
             if self.position != PositionType.NONE and (
                 not self.current_warrant_code or not self.exit_order_id or self.warrant_entry_price <= 0
             ):
@@ -256,10 +346,12 @@ class HSIStrategyEngine:
                 code_match = re.search(r"(HK\.\d+)", record.message)
                 exit_match = re.search(r"已挂 \+2格卖出 @ ([0-9.]+) \| order_id:([^\s|]+)", record.message)
                 entry_match = re.search(r"x([0-9.]+) @ ([0-9.]+)", record.message)
+                mode_match = re.search(r"入[场場]模式[:：]\s*([^;|]+)", record.message)
                 self.position = record.position
                 self.entry_price = float(record.price)
                 self.current_price = self.current_price or float(record.price)
                 self.current_warrant_code = code_match.group(1) if code_match else self.current_warrant_code
+                self.entry_mode = mode_match.group(1).strip() if mode_match else ""
                 if exit_match:
                     self.warrant_exit_price = float(exit_match.group(1))
                     self.exit_order_id = exit_match.group(2)
@@ -355,6 +447,7 @@ class HSIStrategyEngine:
         self.warrant_tick_size = 0.0
         self.warrant_qty = 0.0
         self.stop_loss_order_sent = False
+        self.entry_mode = ""
 
     def _is_after_entry_cutoff(self, current_time: str) -> bool:
         time_part = current_time[11:16] if len(current_time) >= 16 else current_time[:5]
@@ -425,6 +518,7 @@ class HSIStrategyEngine:
         self.entry_chase_count = 0
         self.warrant_tick_size = snapshot["price_spread"]
         self.warrant_qty = float(self.share_count)
+        self.entry_mode = mode
         self._save_runtime_state()
 
         suffix = f" | {extra_message}" if extra_message else ""
@@ -494,6 +588,8 @@ class HSIStrategyEngine:
                 self.entry_order_time = None
                 self._save_runtime_state()
                 label = "牛证" if self.position == PositionType.BULL else "熊证"
+                active_stop_points = self._active_stop_points()
+                active_stop_pnl = self._active_stop_pnl()
                 await self._emit_trade_record(TradeRecord(
                     time=current_time,
                     signal=TradeSignal.BUY_BULL if self.position == PositionType.BULL else TradeSignal.BUY_BEAR,
@@ -504,7 +600,9 @@ class HSIStrategyEngine:
                         f"【{label}】买入全数成交: {self.current_warrant_code} "
                         f"x{dealt_qty:.0f} @ {dealt_avg_price:.3f}; "
                         f"成交时HSI:{fill_hsi_price:.2f}; "
-                        f"已挂 +2格卖出 @ {target_price:.3f} | order_id:{self.exit_order_id}"
+                        f"已挂 +2格卖出 @ {target_price:.3f} | order_id:{self.exit_order_id}; "
+                        f"入场模式:{self.entry_mode or '-'}; "
+                        f"止损阈值:{active_stop_points:.1f}点 / {active_stop_pnl:.0f}HKD"
                     ),
                 ))
             else:
@@ -582,24 +680,169 @@ class HSIStrategyEngine:
         self._save_runtime_state()
 
     async def _monitor_exit_order(self, current_time: str, hsi_price: float, rsi: float):
-        if not self.exit_order_id or self.position == PositionType.NONE:
+        if self.position == PositionType.NONE:
+            return
+        if not self.exit_order_id:
+            if self.stop_loss_order_sent:
+                await self._chase_stop_loss_exit_order(current_time, hsi_price, rsi, None)
             return
 
         order = self.trader.get_order(self.exit_order_id)
-        if order is None or not _is_filled_all(order["order_status"]):
+        if order is None:
+            if self.stop_loss_order_sent:
+                await self._chase_stop_loss_exit_order(current_time, hsi_price, rsi, None)
+            return
+        if not _is_filled_all(order["order_status"]):
+            if self.stop_loss_order_sent:
+                await self._chase_stop_loss_exit_order(current_time, hsi_price, rsi, order)
             return
 
         fill_hsi_price = self._get_live_hsi_price(hsi_price)
         await self._finalize_exit_fill(order, fill_hsi_price, rsi)
 
-    async def _handle_stop_loss(self, current_time: str, hsi_price: float, rsi: float, diff: float, actual_pnl: float):
+    def _get_stop_exit_price(self, code: str) -> tuple[float | None, str]:
+        snapshot = self.data_source.get_security_snapshot(code)
+        if snapshot is None:
+            return None, f"{code} buy1 无效，未能改卖单"
+        stop_price = snapshot.get("bid_price")
+        if stop_price is None or stop_price <= 0:
+            return None, f"{code} buy1 无效: {stop_price}"
+        return float(stop_price), ""
+
+    def _is_terminal_unfilled_exit_status(self, status: str) -> bool:
+        return _order_status_name(status) in TERMINAL_UNFILLED_EXIT_STATUSES
+
+    def _remaining_exit_qty(self, order: dict | None) -> int:
+        dealt_qty = float(order.get("dealt_qty", 0.0)) if order else 0.0
+        base_qty = float(self.warrant_qty or self.share_count)
+        return max(int(round(base_qty - dealt_qty)), 0)
+
+    async def _mark_exit_complete_from_order(self, order: dict, current_time: str, hsi_price: float, rsi: float):
+        fill_hsi_price = self._get_live_hsi_price(hsi_price)
+        complete_order = dict(order)
+        if not complete_order.get("dealt_avg_price"):
+            complete_order["dealt_avg_price"] = self.warrant_exit_price
+        if not complete_order.get("dealt_qty"):
+            complete_order["dealt_qty"] = self.warrant_qty
+        await self._finalize_exit_fill(complete_order, fill_hsi_price, rsi)
+
+    async def _emit_stop_chase_failure(
+        self,
+        current_time: str,
+        hsi_price: float,
+        rsi: float,
+        reason: str,
+        order: dict | None = None,
+    ):
+        dealt_qty = float(order.get("dealt_qty", 0.0)) if order else 0.0
+        remain_qty = self._remaining_exit_qty(order)
+        await self._emit_trade_record(TradeRecord(
+            time=current_time,
+            signal=TradeSignal.STOP_LOSS,
+            price=hsi_price,
+            rsi=round(rsi, 2),
+            position=self.position,
+            message=(
+                f"止损卖单追价失败: {reason} | order_id:{self.exit_order_id or '-'} "
+                f"| 已成交:{dealt_qty:.0f} 剩余:{remain_qty}"
+            ),
+        ))
+
+    async def _chase_stop_loss_exit_order(
+        self,
+        current_time: str,
+        hsi_price: float,
+        rsi: float,
+        order: dict | None,
+    ):
+        if self.position == PositionType.NONE or not self.current_warrant_code:
+            return
+
+        stop_price, reason = self._get_stop_exit_price(self.current_warrant_code)
+        if stop_price is None:
+            await self._emit_stop_chase_failure(current_time, hsi_price, rsi, reason, order)
+            return
+
+        if order is not None and self._is_terminal_unfilled_exit_status(order.get("order_status", "")):
+            remain_qty = self._remaining_exit_qty(order)
+            if remain_qty <= 0:
+                await self._mark_exit_complete_from_order(order, current_time, hsi_price, rsi)
+                return
+            result = self.trader.place_order(
+                self.current_warrant_code,
+                stop_price,
+                remain_qty,
+                "SELL",
+            )
+            if result.get("success"):
+                self.exit_order_id = result["order_id"]
+                self.warrant_exit_price = stop_price
+                self._save_runtime_state()
+            await self._emit_trade_record(TradeRecord(
+                time=current_time,
+                signal=TradeSignal.STOP_LOSS,
+                price=hsi_price,
+                rsi=round(rsi, 2),
+                position=self.position,
+                message=(
+                    f"止损卖单失效，已按最新 buy1 补挂: {self.current_warrant_code} "
+                    f"x{remain_qty} @ {stop_price:.3f} | order_id:{self.exit_order_id or '-'} "
+                    f"| 已成交:{order.get('dealt_qty', 0):.0f} 剩余:{remain_qty} | {result.get('message')}"
+                ),
+            ))
+            return
+
+        target_qty = float(order.get("qty", self.warrant_qty or self.share_count)) if order else float(self.warrant_qty or self.share_count)
+        if not self.exit_order_id:
+            result = self.trader.place_order(
+                self.current_warrant_code,
+                stop_price,
+                int(target_qty),
+                "SELL",
+            )
+            action = "补挂最新 buy1 止损卖单"
+            if result.get("success"):
+                self.exit_order_id = result["order_id"]
+        else:
+            result = self.trader.modify_order(self.exit_order_id, stop_price, target_qty)
+            action = "追价到最新 buy1"
+
+        if result.get("success"):
+            self.warrant_exit_price = stop_price
+            self._save_runtime_state()
+        dealt_qty = float(order.get("dealt_qty", 0.0)) if order else 0.0
+        remain_qty = self._remaining_exit_qty(order)
+        await self._emit_trade_record(TradeRecord(
+            time=current_time,
+            signal=TradeSignal.STOP_LOSS,
+            price=hsi_price,
+            rsi=round(rsi, 2),
+            position=self.position,
+            message=(
+                f"止损卖单未成交，{action}: {self.current_warrant_code} "
+                f"@ {stop_price:.3f} | order_id:{self.exit_order_id or '-'} "
+                f"| 已成交:{dealt_qty:.0f} 剩余:{remain_qty} | {result.get('message')}"
+            ),
+        ))
+
+    async def _handle_stop_loss(
+        self,
+        current_time: str,
+        hsi_price: float,
+        rsi: float,
+        diff: float,
+        actual_pnl: float,
+        active_stop_points: float,
+    ):
         if self.stop_loss_order_sent:
+            order = self.trader.get_order(self.exit_order_id) if self.exit_order_id else None
+            await self._chase_stop_loss_exit_order(current_time, hsi_price, rsi, order)
             return
         if not self.current_warrant_code:
             return
 
-        snapshot = self.data_source.get_security_snapshot(self.current_warrant_code)
-        if snapshot is None:
+        stop_price, reason = self._get_stop_exit_price(self.current_warrant_code)
+        if stop_price is None:
             await self._emit_trade_record(TradeRecord(
                 time=current_time,
                 signal=TradeSignal.STOP_LOSS,
@@ -608,14 +851,16 @@ class HSIStrategyEngine:
                 position=self.position,
                 pnl=round(diff, 2),
                 pnl_hkd=round(actual_pnl, 2),
-                message=f"止损触发，但 {self.current_warrant_code} sell1 无效，未能改卖单",
+                message=(
+                    f"止损触发，但 {reason} | "
+                    f"入场模式:{self.entry_mode or '-'} | 阈值:{active_stop_points:.1f}点"
+                ),
             ))
             return
 
-        stop_price = snapshot["ask_price"]
         if self.exit_order_id:
             result = self.trader.modify_order(self.exit_order_id, stop_price, self.warrant_qty or self.share_count)
-            action = "改价到 sell1"
+            action = "改价到 buy1"
         else:
             result = self.trader.place_order(
                 self.current_warrant_code,
@@ -623,7 +868,7 @@ class HSIStrategyEngine:
                 int(self.warrant_qty or self.share_count),
                 "SELL",
             )
-            action = "补挂 sell1 卖单"
+            action = "补挂 buy1 卖单"
             if result.get("success"):
                 self.exit_order_id = result["order_id"]
 
@@ -641,7 +886,8 @@ class HSIStrategyEngine:
             pnl_hkd=round(actual_pnl, 2),
             message=(
                 f"止损触发，{action}: {self.current_warrant_code} "
-                f"@ {stop_price:.3f} | {result.get('message')}"
+                f"@ {stop_price:.3f} | {result.get('message')} | "
+                f"入场模式:{self.entry_mode or '-'} | 阈值:{active_stop_points:.1f}点"
             ),
         ))
 
@@ -938,8 +1184,9 @@ class HSIStrategyEngine:
                 diff = self.entry_price - price
             actual_pnl = (diff / self.er_ratio) * self.share_count
 
-            if diff <= -self.stop_points:
-                await self._handle_stop_loss(current_time, price, rsi, diff, actual_pnl)
+            active_stop_points = self._active_stop_points()
+            if diff <= -active_stop_points and not self.stop_loss_order_sent:
+                await self._handle_stop_loss(current_time, price, rsi, diff, actual_pnl, active_stop_points)
 
     # ================================================================
     async def start(self):

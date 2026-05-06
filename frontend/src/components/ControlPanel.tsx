@@ -122,6 +122,7 @@ export default function ControlPanel({ isRunning, actionLoading, onStart, onStop
             {[
               ['标的', config.symbol],
               ['止盈止损', `±${config.stop_points} 点`],
+              ['极度止损', `±${config.extreme_stop_points} 点`],
               ['换股比率', config.er_ratio.toLocaleString()],
               ['开仓数量', `${config.share_count.toLocaleString()} 份`],
               ['掛單等待', `${config.entry_order_wait_seconds} 秒`],
@@ -156,6 +157,9 @@ export default function ControlPanel({ isRunning, actionLoading, onStart, onStop
             <InputNumber min={60} max={95} style={{ width: '100%' }} />
           </Form.Item>
           <Form.Item label="目标盈亏 (HKD)" name="target_pnl" style={{ marginBottom: 10 }}>
+            <InputNumber min={100} max={10000} step={100} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item label="极度止损 (HKD)" name="extreme_stop_pnl" style={{ marginBottom: 10 }}>
             <InputNumber min={100} max={10000} step={100} style={{ width: '100%' }} />
           </Form.Item>
           <Form.Item label="轮询间隔 (秒)" name="poll_interval" style={{ marginBottom: 10 }}>

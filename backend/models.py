@@ -69,6 +69,8 @@ class ConfigResponse(BaseModel):
     share_count: int
     target_pnl: int
     stop_points: float
+    extreme_stop_pnl: int
+    extreme_stop_points: float
     bull_warrant_code: str
     bull_warrant_name: str
     bear_warrant_code: str
@@ -85,6 +87,7 @@ class ConfigUpdate(BaseModel):
     er_ratio: Optional[int] = None
     share_count: Optional[int] = None
     target_pnl: Optional[int] = None
+    extreme_stop_pnl: Optional[int] = None
     bull_warrant_code: Optional[str] = None
     bear_warrant_code: Optional[str] = None
     rsi_oversold: Optional[int] = None
