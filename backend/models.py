@@ -17,6 +17,10 @@ class TradeSignal(str, Enum):
     BUY_BEAR = "buy_bear"
     TAKE_PROFIT = "take_profit"
     STOP_LOSS = "stop_loss"
+    ENTRY_PENDING = "entry_pending"
+    ENTRY_CHASING = "entry_chasing"
+    STOP_LOSS_PENDING = "stop_loss_pending"
+    STOP_LOSS_CHASING = "stop_loss_chasing"
     HOLD = "hold"
 
 

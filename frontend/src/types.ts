@@ -2,7 +2,16 @@
 export type PositionType = 'none' | 'bull' | 'bear';
 
 /** 交易信号类型 */
-export type TradeSignal = 'buy_bull' | 'buy_bear' | 'take_profit' | 'stop_loss' | 'hold';
+export type TradeSignal =
+  | 'buy_bull'
+  | 'buy_bear'
+  | 'take_profit'
+  | 'stop_loss'
+  | 'entry_pending'
+  | 'entry_chasing'
+  | 'stop_loss_pending'
+  | 'stop_loss_chasing'
+  | 'hold';
 
 /** 富途交易环境 */
 export type TradeEnv = 'SIMULATE' | 'REAL';

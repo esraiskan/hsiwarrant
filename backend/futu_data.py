@@ -285,6 +285,10 @@ class FutuDataSource:
                 "fall_count": int(row.get("index_fall_count", 0)),
                 "equal_count": int(row.get("index_equal_count", 0)),
                 "amplitude": float(row.get("amplitude", 0)),
+                "open_price": float(row.get("open_price", 0)),
+                "high_price": float(row.get("high_price", 0)),
+                "low_price": float(row.get("low_price", 0)),
+                "last_price": float(row.get("last_price", 0)),
                 "time": str(row.get("update_time", "")),
             }
         except Exception as e:

@@ -59,6 +59,10 @@ def _order_status_name(status: str) -> str:
 
 
 EXTREME_ENTRY_MODES = {"极度超卖", "极度超买"}
+MOMENTUM_ENTRY_MODE = "放量动能"
+MOMENTUM_MIN_K_CHANGE_POINTS = 10.0
+MOMENTUM_MAX_K_CHANGE_POINTS = 20.0
+MOMENTUM_MIN_15M_POINTS = 5.0
 TERMINAL_UNFILLED_EXIT_STATUSES = {
     "CANCELLED_ALL",
     "CANCELLED_PART",
@@ -100,6 +104,7 @@ class HSIStrategyEngine:
         self.warrant_qty = 0.0
         self.stop_loss_order_sent = False
         self.entry_mode = ""
+        self.momentum_entry_trigger_price = 0.0
         self.last_extreme_stop_mode = ""
         self.last_extreme_stop_position = PositionType.NONE
         self.last_extreme_stop_time: datetime | None = None
@@ -293,6 +298,7 @@ class HSIStrategyEngine:
             "warrant_qty": self.warrant_qty,
             "stop_loss_order_sent": self.stop_loss_order_sent,
             "entry_mode": self.entry_mode,
+            "momentum_entry_trigger_price": self.momentum_entry_trigger_price,
             "last_extreme_stop_mode": self.last_extreme_stop_mode,
             "last_extreme_stop_position": self.last_extreme_stop_position.value,
             "last_extreme_stop_time": self.last_extreme_stop_time.isoformat() if self.last_extreme_stop_time else "",
@@ -328,6 +334,7 @@ class HSIStrategyEngine:
             self.warrant_qty = float(data.get("warrant_qty", 0.0))
             self.stop_loss_order_sent = bool(data.get("stop_loss_order_sent", False))
             self.entry_mode = str(data.get("entry_mode", ""))
+            self.momentum_entry_trigger_price = float(data.get("momentum_entry_trigger_price", 0.0))
             self.last_extreme_stop_mode = str(data.get("last_extreme_stop_mode", ""))
             self.last_extreme_stop_position = PositionType(
                 data.get("last_extreme_stop_position", PositionType.NONE.value)
@@ -467,6 +474,7 @@ class HSIStrategyEngine:
         self.warrant_qty = 0.0
         self.stop_loss_order_sent = False
         self.entry_mode = ""
+        self.momentum_entry_trigger_price = 0.0
 
     def _reset_extreme_stop_reversal_guard(self):
         self.last_extreme_stop_mode = ""
@@ -554,7 +562,7 @@ class HSIStrategyEngine:
         result = self.trader.cancel_order(self.pending_buy_order_id)
         await self._emit_trade_record(TradeRecord(
             time=current_time,
-            signal=TradeSignal.HOLD,
+            signal=TradeSignal.ENTRY_CHASING if self.entry_chase_count > 0 else TradeSignal.ENTRY_PENDING,
             price=hsi_price,
             rsi=round(rsi, 2),
             position=PositionType.NONE,
@@ -584,7 +592,7 @@ class HSIStrategyEngine:
         label = "牛证" if side == PositionType.BULL else "熊证"
         if not code:
             await self._emit_trade_record(TradeRecord(
-                time=current_time, signal=signal, price=hsi_price, rsi=round(rsi, 2),
+                time=current_time, signal=TradeSignal.ENTRY_PENDING, price=hsi_price, rsi=round(rsi, 2),
                 position=side, message=f"【{label}·{mode}】未下单: 未配置{label} number",
             ))
             return
@@ -592,7 +600,7 @@ class HSIStrategyEngine:
         snapshot = self.data_source.get_security_snapshot(code)
         if snapshot is None:
             await self._emit_trade_record(TradeRecord(
-                time=current_time, signal=signal, price=hsi_price, rsi=round(rsi, 2),
+                time=current_time, signal=TradeSignal.ENTRY_PENDING, price=hsi_price, rsi=round(rsi, 2),
                 position=side, message=f"【{label}·{mode}】未下单: {code} 买一/卖一/价差无效",
             ))
             return
@@ -601,7 +609,7 @@ class HSIStrategyEngine:
         result = self.trader.place_order(code, buy_price, self.share_count, "BUY")
         if not result.get("success"):
             await self._emit_trade_record(TradeRecord(
-                time=current_time, signal=signal, price=hsi_price, rsi=round(rsi, 2),
+                time=current_time, signal=TradeSignal.ENTRY_PENDING, price=hsi_price, rsi=round(rsi, 2),
                 position=side, message=f"【{label}·{mode}】买入挂单失败: {code} @ {buy_price:.3f} | {result.get('message')}",
             ))
             return
@@ -614,11 +622,12 @@ class HSIStrategyEngine:
         self.warrant_tick_size = snapshot["price_spread"]
         self.warrant_qty = float(self.share_count)
         self.entry_mode = mode
+        self.momentum_entry_trigger_price = hsi_price if mode == MOMENTUM_ENTRY_MODE else 0.0
         self._save_runtime_state()
 
         suffix = f" | {extra_message}" if extra_message else ""
         await self._emit_trade_record(TradeRecord(
-            time=current_time, signal=signal, price=hsi_price, rsi=round(rsi, 2),
+            time=current_time, signal=TradeSignal.ENTRY_PENDING, price=hsi_price, rsi=round(rsi, 2),
             position=side,
             message=(
                 f"【{label}·{mode}】挂 buy1 买入: {code} x{self.share_count} "
@@ -639,7 +648,7 @@ class HSIStrategyEngine:
                 return
             await self._emit_trade_record(TradeRecord(
                 time=current_time,
-                signal=TradeSignal.HOLD,
+                signal=TradeSignal.ENTRY_PENDING,
                 price=hsi_price,
                 rsi=round(rsi, 2),
                 position=PositionType.NONE,
@@ -717,7 +726,7 @@ class HSIStrategyEngine:
         if status_name in {"CANCELLED_ALL", "CANCELLED_PART", "FAILED", "SUBMIT_FAILED", "DELETED", "DISABLED"}:
             await self._emit_trade_record(TradeRecord(
                 time=current_time,
-                signal=TradeSignal.HOLD,
+                signal=TradeSignal.ENTRY_CHASING if self.entry_chase_count > 0 else TradeSignal.ENTRY_PENDING,
                 price=hsi_price,
                 rsi=round(rsi, 2),
                 position=PositionType.NONE,
@@ -728,6 +737,9 @@ class HSIStrategyEngine:
             return
 
         if self.entry_order_time is None:
+            return
+
+        if await self._cancel_stale_momentum_entry(current_time, hsi_price, rsi):
             return
 
         elapsed = (datetime.now() - self.entry_order_time).total_seconds()
@@ -751,7 +763,7 @@ class HSIStrategyEngine:
                 self._save_runtime_state()
                 await self._emit_trade_record(TradeRecord(
                     time=current_time,
-                    signal=TradeSignal.HOLD,
+                    signal=TradeSignal.ENTRY_CHASING,
                     price=hsi_price,
                     rsi=round(rsi, 2),
                     position=PositionType.NONE,
@@ -762,7 +774,7 @@ class HSIStrategyEngine:
         result = self.trader.cancel_order(self.pending_buy_order_id)
         await self._emit_trade_record(TradeRecord(
             time=current_time,
-            signal=TradeSignal.HOLD,
+            signal=TradeSignal.ENTRY_CHASING,
             price=hsi_price,
             rsi=round(rsi, 2),
             position=PositionType.NONE,
@@ -773,6 +785,38 @@ class HSIStrategyEngine:
         ))
         self._reset_order_state()
         self._save_runtime_state()
+
+    async def _cancel_stale_momentum_entry(self, current_time: str, hsi_price: float, rsi: float) -> bool:
+        if self.entry_mode != MOMENTUM_ENTRY_MODE or self.momentum_entry_trigger_price <= 0:
+            return False
+        if self.pending_entry_side == PositionType.BULL:
+            stale = hsi_price < self.momentum_entry_trigger_price
+            reason = "现价跌回触发价下方"
+        elif self.pending_entry_side == PositionType.BEAR:
+            stale = hsi_price > self.momentum_entry_trigger_price
+            reason = "现价弹回触发价上方"
+        else:
+            return False
+        if not stale:
+            return False
+
+        result = self.trader.cancel_order(self.pending_buy_order_id)
+        label = "牛证" if self.pending_entry_side == PositionType.BULL else "熊证"
+        await self._emit_trade_record(TradeRecord(
+            time=current_time,
+            signal=TradeSignal.ENTRY_CHASING if self.entry_chase_count > 0 else TradeSignal.ENTRY_PENDING,
+            price=hsi_price,
+            rsi=round(rsi, 2),
+            position=PositionType.NONE,
+            message=(
+                f"【{label}·{MOMENTUM_ENTRY_MODE}】取消追价: {reason} "
+                f"HSI:{hsi_price:.2f} trigger:{self.momentum_entry_trigger_price:.2f} | "
+                f"order_id:{self.pending_buy_order_id} | {result.get('message')}"
+            ),
+        ))
+        self._reset_order_state()
+        self._save_runtime_state()
+        return True
 
     async def _monitor_exit_order(self, current_time: str, hsi_price: float, rsi: float):
         if self.position == PositionType.NONE:
@@ -833,7 +877,7 @@ class HSIStrategyEngine:
         remain_qty = self._remaining_exit_qty(order)
         await self._emit_trade_record(TradeRecord(
             time=current_time,
-            signal=TradeSignal.STOP_LOSS,
+            signal=TradeSignal.STOP_LOSS_CHASING,
             price=hsi_price,
             rsi=round(rsi, 2),
             position=self.position,
@@ -875,7 +919,7 @@ class HSIStrategyEngine:
                 self._save_runtime_state()
             await self._emit_trade_record(TradeRecord(
                 time=current_time,
-                signal=TradeSignal.STOP_LOSS,
+                signal=TradeSignal.STOP_LOSS_CHASING,
                 price=hsi_price,
                 rsi=round(rsi, 2),
                 position=self.position,
@@ -909,7 +953,7 @@ class HSIStrategyEngine:
         remain_qty = self._remaining_exit_qty(order)
         await self._emit_trade_record(TradeRecord(
             time=current_time,
-            signal=TradeSignal.STOP_LOSS,
+            signal=TradeSignal.STOP_LOSS_CHASING,
             price=hsi_price,
             rsi=round(rsi, 2),
             position=self.position,
@@ -940,7 +984,7 @@ class HSIStrategyEngine:
         if stop_price is None:
             await self._emit_trade_record(TradeRecord(
                 time=current_time,
-                signal=TradeSignal.STOP_LOSS,
+                signal=TradeSignal.STOP_LOSS_PENDING,
                 price=hsi_price,
                 rsi=round(rsi, 2),
                 position=self.position,
@@ -973,7 +1017,7 @@ class HSIStrategyEngine:
             self._save_runtime_state()
         await self._emit_trade_record(TradeRecord(
             time=current_time,
-            signal=TradeSignal.STOP_LOSS,
+            signal=TradeSignal.STOP_LOSS_PENDING,
             price=hsi_price,
             rsi=round(rsi, 2),
             position=self.position,
@@ -1127,6 +1171,7 @@ class HSIStrategyEngine:
         # 4. 15M 跨周期确认
         m15_is_green = curr_15m["close"] > curr_15m["open"]
         m15_is_red = curr_15m["close"] < curr_15m["open"]
+        m15_change = curr_15m["close"] - curr_15m["open"]
 
         # 5. 累积涨跌幅 (最近5根1M K线)
         cum5 = 0.0
@@ -1204,29 +1249,60 @@ class HSIStrategyEngine:
             if self.position == PositionType.NONE:
                 k_change = k_close - k_open
                 vol_surge = vol > vol_ma * 1.5
+                momentum_ratio = vol / vol_ma if vol_ma > 0 else 0.0
+                bull_momentum_size_ok = (
+                    MOMENTUM_MIN_K_CHANGE_POINTS < k_change <= MOMENTUM_MAX_K_CHANGE_POINTS
+                )
+                bear_momentum_size_ok = (
+                    -MOMENTUM_MAX_K_CHANGE_POINTS <= k_change < -MOMENTUM_MIN_K_CHANGE_POINTS
+                )
+                bull_m15_ok = m15_change >= MOMENTUM_MIN_15M_POINTS
+                bear_m15_ok = m15_change <= -MOMENTUM_MIN_15M_POINTS
 
-                if vol_surge and k_change > 10 and curr_slope > 0:
+                if vol_surge and k_change > MOMENTUM_MIN_K_CHANGE_POINTS and curr_slope > 0:
                     skip_reasons = get_momentum_filter_reasons(
                         "bull", float(rsi), breadth_ratio
                     )
+                    if not bull_momentum_size_ok:
+                        skip_reasons.append(
+                            f"extended k_change={k_change:.1f} max={MOMENTUM_MAX_K_CHANGE_POINTS:.1f}"
+                        )
+                    if not bull_m15_ok:
+                        skip_reasons.append(
+                            f"weak 15M change={m15_change:.1f} min={MOMENTUM_MIN_15M_POINTS:.1f}"
+                        )
                     if skip_reasons:
                         print(f"  >>> Skip bull momentum: {'; '.join(skip_reasons)}")
                     else:
                         await self._submit_entry_order(
-                            PositionType.BULL, price, rsi, current_time, "放量动能",
-                            extra_message=f"涨{k_change:.1f}点 | {vol/vol_ma:.1f}x量",
+                            PositionType.BULL, price, rsi, current_time, MOMENTUM_ENTRY_MODE,
+                            extra_message=(
+                                f"涨{k_change:.1f}点 | {momentum_ratio:.1f}x量 | "
+                                f"15M:{m15_change:+.1f}"
+                            ),
                         )
 
-                elif vol_surge and k_change < -10 and curr_slope < 0:
+                elif vol_surge and k_change < -MOMENTUM_MIN_K_CHANGE_POINTS and curr_slope < 0:
                     skip_reasons = get_momentum_filter_reasons(
                         "bear", float(rsi), breadth_ratio
                     )
+                    if not bear_momentum_size_ok:
+                        skip_reasons.append(
+                            f"extended k_change={k_change:.1f} max={MOMENTUM_MAX_K_CHANGE_POINTS:.1f}"
+                        )
+                    if not bear_m15_ok:
+                        skip_reasons.append(
+                            f"weak 15M change={m15_change:.1f} min=-{MOMENTUM_MIN_15M_POINTS:.1f}"
+                        )
                     if skip_reasons:
                         print(f"  >>> Skip bear momentum: {'; '.join(skip_reasons)}")
                     else:
                         await self._submit_entry_order(
-                            PositionType.BEAR, price, rsi, current_time, "放量动能",
-                            extra_message=f"跌{abs(k_change):.1f}点 | {vol/vol_ma:.1f}x量",
+                            PositionType.BEAR, price, rsi, current_time, MOMENTUM_ENTRY_MODE,
+                            extra_message=(
+                                f"跌{abs(k_change):.1f}点 | {momentum_ratio:.1f}x量 | "
+                                f"15M:{m15_change:+.1f}"
+                            ),
                         )
 
             # --- 累积趋势信号 (温水煮青蛙式单边) ---
@@ -1236,10 +1312,15 @@ class HSIStrategyEngine:
             #   2. 信号方向必须和开盘以来的整体方向一致
             #   3. 涨跌家数比必须支持信号方向
             if self.position == PositionType.NONE and abs(cum5) >= 40:
-                day_high = df_1m["high"].max()
-                day_low = df_1m["low"].min()
+                day_open = float(snapshot.get("open_price", 0)) if snapshot else 0.0
+                day_high = float(snapshot.get("high_price", 0)) if snapshot else 0.0
+                day_low = float(snapshot.get("low_price", 0)) if snapshot else 0.0
+                if day_open <= 0 or day_high <= 0 or day_low <= 0 or day_high < day_low:
+                    day_open = float(df_1m.iloc[0]["open"])
+                    day_high = float(df_1m["high"].max())
+                    day_low = float(df_1m["low"].min())
                 day_range = day_high - day_low
-                day_trend = price - df_1m.iloc[0]["open"]
+                day_trend = price - day_open
 
                 if day_range >= 150:
                     # 做空信号：累积跌 + 当天整体也在跌

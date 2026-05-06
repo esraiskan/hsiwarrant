@@ -12,6 +12,10 @@ const signalConfig: Record<TradeSignal, { color: string; bg: string; label: stri
   buy_bear: { color: colors.bear, bg: 'rgba(255,77,106,0.12)', label: '买入熊证 🔻' },
   take_profit: { color: '#f59e0b', bg: 'rgba(245,158,11,0.12)', label: '止盈平仓 💰' },
   stop_loss: { color: '#ef4444', bg: 'rgba(239,68,68,0.12)', label: '止损平仓 🛡️' },
+  entry_pending: { color: '#38bdf8', bg: 'rgba(56,189,248,0.12)', label: '挂单阶段' },
+  entry_chasing: { color: '#a78bfa', bg: 'rgba(167,139,250,0.12)', label: '追单挂单阶段' },
+  stop_loss_pending: { color: '#fb7185', bg: 'rgba(251,113,133,0.12)', label: '止损挂单阶段' },
+  stop_loss_chasing: { color: '#f97316', bg: 'rgba(249,115,22,0.12)', label: '止损追单挂单阶段' },
   hold: { color: colors.textMuted, bg: 'transparent', label: '持仓' },
 };
 
@@ -28,8 +32,28 @@ const columns: ColumnsType<TradeRecord & { key: number }> = [
     title: '信号',
     dataIndex: 'signal',
     width: 140,
-    render: (s: TradeSignal) => {
-      const cfg = signalConfig[s];
+    render: (s: TradeSignal, record) => {
+      const message = record.message || '';
+      const isLegacyEntryOrder =
+        !message.includes('买入全数成交')
+        && (
+          /买入.*(挂|挂单|未成交|追价|取消|pending|order_id)/.test(message)
+          || /挂.*买入/.test(message)
+          || message.includes('未下单')
+        );
+      const isLegacyStopLossOrder =
+        s === 'stop_loss'
+        && message.includes('止损')
+        && !message.includes('卖出成交');
+      const cfg = isLegacyStopLossOrder
+        ? (message.includes('追价') || message.includes('失效') || message.includes('未成交')
+          ? signalConfig.stop_loss_chasing
+          : signalConfig.stop_loss_pending)
+        : (s === 'hold' || s === 'buy_bull' || s === 'buy_bear') && isLegacyEntryOrder
+        ? (message.includes('追价') || message.includes('追价后') || message.includes('取消')
+          ? signalConfig.entry_chasing
+          : signalConfig.entry_pending)
+        : signalConfig[s];
       return (
         <span style={{
           color: cfg.color, background: cfg.bg,
