@@ -739,9 +739,6 @@ class HSIStrategyEngine:
         if self.entry_order_time is None:
             return
 
-        if await self._cancel_stale_momentum_entry(current_time, hsi_price, rsi):
-            return
-
         elapsed = (datetime.now() - self.entry_order_time).total_seconds()
         if elapsed < self.entry_order_wait_seconds:
             return
@@ -785,38 +782,6 @@ class HSIStrategyEngine:
         ))
         self._reset_order_state()
         self._save_runtime_state()
-
-    async def _cancel_stale_momentum_entry(self, current_time: str, hsi_price: float, rsi: float) -> bool:
-        if self.entry_mode != MOMENTUM_ENTRY_MODE or self.momentum_entry_trigger_price <= 0:
-            return False
-        if self.pending_entry_side == PositionType.BULL:
-            stale = hsi_price < self.momentum_entry_trigger_price
-            reason = "现价跌回触发价下方"
-        elif self.pending_entry_side == PositionType.BEAR:
-            stale = hsi_price > self.momentum_entry_trigger_price
-            reason = "现价弹回触发价上方"
-        else:
-            return False
-        if not stale:
-            return False
-
-        result = self.trader.cancel_order(self.pending_buy_order_id)
-        label = "牛证" if self.pending_entry_side == PositionType.BULL else "熊证"
-        await self._emit_trade_record(TradeRecord(
-            time=current_time,
-            signal=TradeSignal.ENTRY_CHASING if self.entry_chase_count > 0 else TradeSignal.ENTRY_PENDING,
-            price=hsi_price,
-            rsi=round(rsi, 2),
-            position=PositionType.NONE,
-            message=(
-                f"【{label}·{MOMENTUM_ENTRY_MODE}】取消追价: {reason} "
-                f"HSI:{hsi_price:.2f} trigger:{self.momentum_entry_trigger_price:.2f} | "
-                f"order_id:{self.pending_buy_order_id} | {result.get('message')}"
-            ),
-        ))
-        self._reset_order_state()
-        self._save_runtime_state()
-        return True
 
     async def _monitor_exit_order(self, current_time: str, hsi_price: float, rsi: float):
         if self.position == PositionType.NONE:
