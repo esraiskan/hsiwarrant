@@ -1279,12 +1279,12 @@ class HSIStrategyEngine:
                         )
 
             # --- 累积趋势信号 (温水煮青蛙式单边) ---
-            # 最近5根1M累积跌/涨 > 40点 + VWAP方向一致
+            # 最近5根1M累积跌/涨 > 30点 + VWAP方向一致
             # 过滤条件：
             #   1. 日内区间 >= 100点 (确认有波动)
             #   2. 信号方向必须和开盘以来的整体方向一致
             #   3. 涨跌家数比必须支持信号方向
-            if self.position == PositionType.NONE and abs(cum5) >= 40:
+            if self.position == PositionType.NONE and abs(cum5) >= 30:
                 day_open = float(snapshot.get("open_price", 0)) if snapshot else 0.0
                 day_high = float(snapshot.get("high_price", 0)) if snapshot else 0.0
                 day_low = float(snapshot.get("low_price", 0)) if snapshot else 0.0
@@ -1297,7 +1297,7 @@ class HSIStrategyEngine:
 
                 if day_range >= 100:
                     # 做空信号：累积跌 + 当天整体也在跌
-                    if cum5 < -40 and curr_slope < 0 and day_trend < 0:
+                    if cum5 < -30 and curr_slope < 0 and day_trend < 0:
                         skip_reasons = get_cum_trend_filter_reasons(
                             "bear", breadth_ratio
                         )
@@ -1319,7 +1319,7 @@ class HSIStrategyEngine:
                             )
 
                     # 做多信号：累积涨 + 当天整体也在涨
-                    elif cum5 > 40 and curr_slope > 0 and day_trend > 0:
+                    elif cum5 > 30 and curr_slope > 0 and day_trend > 0:
                         skip_reasons = get_cum_trend_filter_reasons(
                             "bull", breadth_ratio
                         )

@@ -96,9 +96,9 @@ for i in range(start_idx, len(d1)):
             elif vol_surge and k_chg < -10 and cs < 0:
                 sig = ("bear", "Momentum %.1f %.1fx" % (k_chg, vol/vma))
         if not sig:
-            if cum5 < -40 and cs < 0:
+            if cum5 < -30 and cs < 0:
                 sig = ("bear", "CumTrend %.1f" % cum5)
-            elif cum5 > 40 and cs > 0:
+            elif cum5 > 30 and cs > 0:
                 sig = ("bull", "CumTrend +%.1f" % cum5)
         if sig:
             pos, desc = sig; entry = price; et = t.strftime("%H:%M")
