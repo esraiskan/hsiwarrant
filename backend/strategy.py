@@ -1298,47 +1298,59 @@ class HSIStrategyEngine:
                 if day_range >= 100:
                     # 做空信号：累积跌 + 当天整体也在跌
                     if cum5 < -30 and curr_slope < 0 and day_trend < 0:
-                        skip_reasons = get_cum_trend_filter_reasons(
-                            "bear", breadth_ratio
-                        )
-                        if skip_reasons:
-                            print(f"  >>> Skip bear cumtrend: {'; '.join(skip_reasons)}")
+                        if rsi < self.rsi_oversold:
+                            print(
+                                f"  >>> Skip bear cumtrend: RSI extreme oversold "
+                                f"rsi={rsi:.2f} threshold={self.rsi_oversold:.2f}"
+                            )
                         else:
-                            blocked, remaining = self._is_blocked_by_extreme_stop_reversal_guard(
-                                "bear", current_time
+                            skip_reasons = get_cum_trend_filter_reasons(
+                                "bear", breadth_ratio
                             )
-                            if blocked:
-                                await self._emit_reversal_guard_skip(
-                                    current_time, price, rsi, "bear", remaining
+                            if skip_reasons:
+                                print(f"  >>> Skip bear cumtrend: {'; '.join(skip_reasons)}")
+                            else:
+                                blocked, remaining = self._is_blocked_by_extreme_stop_reversal_guard(
+                                    "bear", current_time
                                 )
-                                return
-                            ratio = breadth_ratio
-                            await self._submit_entry_order(
-                                PositionType.BEAR, price, rsi, current_time, "累积趋势",
-                                extra_message=f"5根累跌{cum5:.1f}点 | 日内{day_range:.0f}点 | R:{ratio:.2f}",
-                            )
+                                if blocked:
+                                    await self._emit_reversal_guard_skip(
+                                        current_time, price, rsi, "bear", remaining
+                                    )
+                                    return
+                                ratio = breadth_ratio
+                                await self._submit_entry_order(
+                                    PositionType.BEAR, price, rsi, current_time, "累积趋势",
+                                    extra_message=f"5根累跌{cum5:.1f}点 | 日内{day_range:.0f}点 | R:{ratio:.2f}",
+                                )
 
                     # 做多信号：累积涨 + 当天整体也在涨
                     elif cum5 > 30 and curr_slope > 0 and day_trend > 0:
-                        skip_reasons = get_cum_trend_filter_reasons(
-                            "bull", breadth_ratio
-                        )
-                        if skip_reasons:
-                            print(f"  >>> Skip bull cumtrend: {'; '.join(skip_reasons)}")
+                        if rsi > self.rsi_overbought:
+                            print(
+                                f"  >>> Skip bull cumtrend: RSI extreme overbought "
+                                f"rsi={rsi:.2f} threshold={self.rsi_overbought:.2f}"
+                            )
                         else:
-                            blocked, remaining = self._is_blocked_by_extreme_stop_reversal_guard(
-                                "bull", current_time
+                            skip_reasons = get_cum_trend_filter_reasons(
+                                "bull", breadth_ratio
                             )
-                            if blocked:
-                                await self._emit_reversal_guard_skip(
-                                    current_time, price, rsi, "bull", remaining
+                            if skip_reasons:
+                                print(f"  >>> Skip bull cumtrend: {'; '.join(skip_reasons)}")
+                            else:
+                                blocked, remaining = self._is_blocked_by_extreme_stop_reversal_guard(
+                                    "bull", current_time
                                 )
-                                return
-                            ratio = breadth_ratio
-                            await self._submit_entry_order(
-                                PositionType.BULL, price, rsi, current_time, "累积趋势",
-                                extra_message=f"5根累涨{cum5:.1f}点 | 日内{day_range:.0f}点 | R:{ratio:.2f}",
-                            )
+                                if blocked:
+                                    await self._emit_reversal_guard_skip(
+                                        current_time, price, rsi, "bull", remaining
+                                    )
+                                    return
+                                ratio = breadth_ratio
+                                await self._submit_entry_order(
+                                    PositionType.BULL, price, rsi, current_time, "累积趋势",
+                                    extra_message=f"5根累涨{cum5:.1f}点 | 日内{day_range:.0f}点 | R:{ratio:.2f}",
+                                )
 
         else:
             # 止盈止损

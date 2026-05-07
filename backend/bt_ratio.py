@@ -60,8 +60,8 @@ def bt(d1, d15, allow_cum):
                 if vol_surge and k_chg > 10 and cs > 0: sig = ("bull", "Mom")
                 elif vol_surge and k_chg < -10 and cs < 0: sig = ("bear", "Mom")
             if not sig and allow_cum and abs(cum5) >= 30 and day_range >= 150:
-                if cum5 < -30 and cs < 0 and day_trend < 0: sig = ("bear", "Cum")
-                elif cum5 > 30 and cs > 0 and day_trend > 0: sig = ("bull", "Cum")
+                if cum5 < -30 and cs < 0 and day_trend < 0 and rsi >= RSI_OVERSOLD: sig = ("bear", "Cum")
+                elif cum5 > 30 and cs > 0 and day_trend > 0 and rsi <= RSI_OVERBOUGHT: sig = ("bull", "Cum")
             if sig: pos = sig[0]; entry = price; et = t.strftime("%H:%M")
         else:
             diff = (price - entry) if pos == "bull" else (entry - price)
