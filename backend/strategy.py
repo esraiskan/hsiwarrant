@@ -60,9 +60,8 @@ def _order_status_name(status: str) -> str:
 
 EXTREME_ENTRY_MODES = {"极度超卖", "极度超买"}
 MOMENTUM_ENTRY_MODE = "放量动能"
-MOMENTUM_MIN_K_CHANGE_POINTS = 10.0
-MOMENTUM_MAX_K_CHANGE_POINTS = 20.0
-MOMENTUM_MIN_15M_POINTS = 5.0
+MOMENTUM_MIN_K_BODY_POINTS = 5.0
+MOMENTUM_MAX_K_BODY_POINTS = 30.0
 TERMINAL_UNFILLED_EXIT_STATUSES = {
     "CANCELLED_ALL",
     "CANCELLED_PART",
@@ -1179,94 +1178,92 @@ class HSIStrategyEngine:
 
         if self.position == PositionType.NONE:
             # --- 牛证 ---
-            # 极度超卖 (RSI < 18): 只要放量就入场，不等形态确认
             # 普通超卖 (18 <= RSI < 25): 需要全部5个条件
-            bull_extreme = rsi < self.rsi_oversold and vol_is_high
             bull_normal = (self.rsi_oversold <= rsi < 25
                            and vwap_turning_up and vol_is_high
                            and k_bull_pattern and m15_is_green)
 
-            if bull_extreme or bull_normal:
-                mode = "极度超卖" if bull_extreme else "普通超卖"
+            if bull_normal:
                 await self._submit_entry_order(
-                    PositionType.BULL, price, rsi, current_time, mode,
+                    PositionType.BULL, price, rsi, current_time, "普通超卖",
                     extra_message=f"HSI:{price:.2f} RSI:{rsi:.2f}",
                 )
 
             # --- 熊证 ---
-            # 极度超买 (RSI > 82): 只要放量就入场
             # 普通超买 (75 < RSI <= 82): 需要全部5个条件
             elif rsi > 75:
-                bear_extreme = rsi > self.rsi_overbought and vol_is_high
                 bear_normal = (75 < rsi <= self.rsi_overbought
                                and vwap_turning_down and vol_is_high
                                and k_bear_pattern and m15_is_red)
 
-                if bear_extreme or bear_normal:
-                    mode = "极度超买" if bear_extreme else "普通超买"
+                if bear_normal:
                     await self._submit_entry_order(
-                        PositionType.BEAR, price, rsi, current_time, mode,
+                        PositionType.BEAR, price, rsi, current_time, "普通超买",
                         extra_message=f"HSI:{price:.2f} RSI:{rsi:.2f}",
                     )
 
-            # --- 放量动能信号 (不以 RSI 触发，但用 RSI / 市宽过滤追价) ---
-            # 成交额 > 1.5 倍均量 + 1M K 线大幅单边 (>10点) + VWAP 方向一致
-            if self.position == PositionType.NONE:
+            # --- 放量动能信号 ---
+            # 先命中放量动能；若 RSI 到达极度阈值，优先走极度反转，否则跟随放量方向。
+            if self.position == PositionType.NONE and not self.pending_buy_order_id:
                 k_change = k_close - k_open
+                k_body_points = abs(k_change)
                 vol_surge = vol > vol_ma * 1.5
                 momentum_ratio = vol / vol_ma if vol_ma > 0 else 0.0
-                bull_momentum_size_ok = (
-                    MOMENTUM_MIN_K_CHANGE_POINTS < k_change <= MOMENTUM_MAX_K_CHANGE_POINTS
+                momentum_body_ok = (
+                    MOMENTUM_MIN_K_BODY_POINTS <= k_body_points <= MOMENTUM_MAX_K_BODY_POINTS
                 )
-                bear_momentum_size_ok = (
-                    -MOMENTUM_MAX_K_CHANGE_POINTS <= k_change < -MOMENTUM_MIN_K_CHANGE_POINTS
-                )
-                bull_m15_ok = m15_change >= MOMENTUM_MIN_15M_POINTS
-                bear_m15_ok = m15_change <= -MOMENTUM_MIN_15M_POINTS
 
-                if vol_surge and k_change > MOMENTUM_MIN_K_CHANGE_POINTS and curr_slope > 0:
+                if vol_surge and k_change != 0 and not momentum_body_ok:
+                    print(
+                        f"  >>> Skip momentum: k_body={k_body_points:.1f} "
+                        f"range={MOMENTUM_MIN_K_BODY_POINTS:.1f}-{MOMENTUM_MAX_K_BODY_POINTS:.1f}"
+                    )
+
+                elif vol_surge and k_change != 0 and rsi < self.rsi_oversold:
+                    await self._submit_entry_order(
+                        PositionType.BULL, price, rsi, current_time, "极度超卖",
+                        extra_message=(
+                            f"放量动能触发 | RSI:{rsi:.2f} | "
+                            f"{'阳线涨' if k_change > 0 else '阴线跌'}{abs(k_change):.1f}点 | "
+                            f"{momentum_ratio:.1f}x量"
+                        ),
+                    )
+
+                elif vol_surge and k_change != 0 and rsi > self.rsi_overbought:
+                    await self._submit_entry_order(
+                        PositionType.BEAR, price, rsi, current_time, "极度超买",
+                        extra_message=(
+                            f"放量动能触发 | RSI:{rsi:.2f} | "
+                            f"{'阳线涨' if k_change > 0 else '阴线跌'}{abs(k_change):.1f}点 | "
+                            f"{momentum_ratio:.1f}x量"
+                        ),
+                    )
+
+                elif vol_surge and k_change > 0:
                     skip_reasons = get_momentum_filter_reasons(
                         "bull", float(rsi), breadth_ratio
                     )
-                    if not bull_momentum_size_ok:
-                        skip_reasons.append(
-                            f"extended k_change={k_change:.1f} max={MOMENTUM_MAX_K_CHANGE_POINTS:.1f}"
-                        )
-                    if not bull_m15_ok:
-                        skip_reasons.append(
-                            f"weak 15M change={m15_change:.1f} min={MOMENTUM_MIN_15M_POINTS:.1f}"
-                        )
                     if skip_reasons:
                         print(f"  >>> Skip bull momentum: {'; '.join(skip_reasons)}")
                     else:
                         await self._submit_entry_order(
                             PositionType.BULL, price, rsi, current_time, MOMENTUM_ENTRY_MODE,
                             extra_message=(
-                                f"涨{k_change:.1f}点 | {momentum_ratio:.1f}x量 | "
-                                f"15M:{m15_change:+.1f}"
+                                f"阳线涨{k_change:.1f}点 | {momentum_ratio:.1f}x量"
                             ),
                         )
 
-                elif vol_surge and k_change < -MOMENTUM_MIN_K_CHANGE_POINTS and curr_slope < 0:
+                elif vol_surge and k_change < 0:
                     skip_reasons = get_momentum_filter_reasons(
                         "bear", float(rsi), breadth_ratio
                     )
-                    if not bear_momentum_size_ok:
-                        skip_reasons.append(
-                            f"extended k_change={k_change:.1f} max={MOMENTUM_MAX_K_CHANGE_POINTS:.1f}"
-                        )
-                    if not bear_m15_ok:
-                        skip_reasons.append(
-                            f"weak 15M change={m15_change:.1f} min=-{MOMENTUM_MIN_15M_POINTS:.1f}"
-                        )
                     if skip_reasons:
                         print(f"  >>> Skip bear momentum: {'; '.join(skip_reasons)}")
                     else:
                         await self._submit_entry_order(
                             PositionType.BEAR, price, rsi, current_time, MOMENTUM_ENTRY_MODE,
                             extra_message=(
-                                f"跌{abs(k_change):.1f}点 | {momentum_ratio:.1f}x量 | "
-                                f"15M:{m15_change:+.1f}"
+                                f"阴线跌{abs(k_change):.1f}点 | {momentum_ratio:.1f}x量"
                             ),
                         )
 
