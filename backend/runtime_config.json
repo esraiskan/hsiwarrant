@@ -5,8 +5,9 @@
   "extreme_stop_pnl": 500,
   "bull_warrant_code": "HK.54029",
   "bear_warrant_code": "HK.61355",
-  "rsi_oversold": 22,
+  "rsi_length": 6,
+  "rsi_oversold": 20,
   "rsi_overbought": 79,
-  "poll_interval": 3,
+  "poll_interval": 2,
   "entry_order_wait_seconds": 40
 }

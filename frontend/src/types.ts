@@ -75,6 +75,7 @@ export interface StrategyConfig {
   bull_warrant_name: string;
   bear_warrant_code: string;
   bear_warrant_name: string;
+  rsi_length: number;
   rsi_oversold: number;
   rsi_overbought: number;
   vol_ma_period: number;

@@ -79,6 +79,7 @@ class ConfigResponse(BaseModel):
     bull_warrant_name: str
     bear_warrant_code: str
     bear_warrant_name: str
+    rsi_length: int
     rsi_oversold: int
     rsi_overbought: int
     vol_ma_period: int
@@ -94,6 +95,7 @@ class ConfigUpdate(BaseModel):
     extreme_stop_pnl: Optional[int] = None
     bull_warrant_code: Optional[str] = None
     bear_warrant_code: Optional[str] = None
+    rsi_length: Optional[int] = None
     rsi_oversold: Optional[int] = None
     rsi_overbought: Optional[int] = None
     vol_ma_period: Optional[int] = None

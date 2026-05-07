@@ -130,6 +130,7 @@ async def get_config():
         bull_warrant_name=bull_name,
         bear_warrant_code=engine.bear_warrant_code,
         bear_warrant_name=bear_name,
+        rsi_length=engine.rsi_length,
         rsi_oversold=engine.rsi_oversold,
         rsi_overbought=engine.rsi_overbought,
         vol_ma_period=VOL_MA_PERIOD,

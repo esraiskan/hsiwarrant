@@ -9,10 +9,16 @@ import OpenDPanel from './components/OpenDPanel';
 import { useWebSocket } from './useWebSocket';
 import { colors } from './theme';
 import * as api from './api';
+import type { StrategyConfig } from './types';
 
 export default function App() {
   const { connected, state, klines, trades, todayPnl, clearData, refreshData, refreshTodayPnl } = useWebSocket();
   const [actionLoading, setActionLoading] = useState<'start' | 'stop' | 'reset' | null>(null);
+  const [rsiLength, setRsiLength] = useState(14);
+
+  const handleConfigLoaded = useCallback((config: StrategyConfig) => {
+    setRsiLength(config.rsi_length);
+  }, []);
 
   const handleStart = useCallback(async () => {
     try {
@@ -101,12 +107,13 @@ export default function App() {
 
           <Row gutter={16}>
             <Col xs={24} lg={17}>
-              <PriceChart klines={klines} trades={trades} entryPrice={state?.entry_price ?? 0} />
+              <PriceChart klines={klines} trades={trades} entryPrice={state?.entry_price ?? 0} rsiLength={rsiLength} />
             </Col>
             <Col xs={24} lg={7}>
               <ControlPanel
                 isRunning={state?.is_running ?? false}
                 actionLoading={actionLoading}
+                onConfigLoaded={handleConfigLoaded}
                 onStart={handleStart}
                 onStop={handleStop}
                 onReset={handleReset}

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Button, Input, InputNumber, Form, message } from 'antd';
+import { Button, Input, InputNumber, Form, Select, message } from 'antd';
 import {
   PlayCircleOutlined,
   PauseCircleOutlined,
@@ -12,6 +12,7 @@ import type { StrategyConfig } from '../types';
 interface Props {
   isRunning: boolean;
   actionLoading: 'start' | 'stop' | 'reset' | null;
+  onConfigLoaded?: (config: StrategyConfig) => void;
   onStart: () => void;
   onStop: () => void;
   onReset: () => void;
@@ -28,14 +29,17 @@ function SectionTitle({ children }: { children: React.ReactNode }) {
   );
 }
 
-export default function ControlPanel({ isRunning, actionLoading, onStart, onStop, onReset }: Props) {
+export default function ControlPanel({ isRunning, actionLoading, onConfigLoaded, onStart, onStop, onReset }: Props) {
   const [config, setConfig] = useState<StrategyConfig | null>(null);
   const [loading, setLoading] = useState(false);
   const [form] = Form.useForm();
 
   useEffect(() => {
-    api.getConfig().then(setConfig).catch(() => {});
-  }, []);
+    api.getConfig().then((loaded) => {
+      setConfig(loaded);
+      onConfigLoaded?.(loaded);
+    }).catch(() => {});
+  }, [onConfigLoaded]);
 
   useEffect(() => {
     if (config) form.setFieldsValue(config);
@@ -48,6 +52,7 @@ export default function ControlPanel({ isRunning, actionLoading, onStart, onStop
       await api.updateConfig(values);
       const updated = await api.getConfig();
       setConfig(updated);
+      onConfigLoaded?.(updated);
       message.success('配置已更新');
     } catch { message.error('保存失败'); }
     finally { setLoading(false); }
@@ -120,11 +125,11 @@ export default function ControlPanel({ isRunning, actionLoading, onStart, onStop
             display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8,
           }}>
             {[
-              ['标的', config.symbol],
               ['止盈止损', `±${config.stop_points} 点`],
               ['极度止损', `±${config.extreme_stop_points} 点`],
               ['换股比率', config.er_ratio.toLocaleString()],
               ['开仓数量', `${config.share_count.toLocaleString()} 份`],
+              ['RSI 周期', `${config.rsi_length}`],
               ['掛單等待', `${config.entry_order_wait_seconds} 秒`],
               ['牛证', config.bull_warrant_code ? `${config.bull_warrant_code} ${config.bull_warrant_name || ''}` : '未设置'],
               ['熊证', config.bear_warrant_code ? `${config.bear_warrant_code} ${config.bear_warrant_name || ''}` : '未设置'],
@@ -145,10 +150,33 @@ export default function ControlPanel({ isRunning, actionLoading, onStart, onStop
       <Form form={form} layout="vertical" size="small">
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0 12px' }}>
           <Form.Item label="牛证 Number" name="bull_warrant_code" style={{ marginBottom: 10 }}>
-            <Input placeholder="例如 61234" />
+            <Input
+              placeholder="例如 61234"
+              style={{
+                background: colors.upBg,
+                borderColor: colors.up,
+              }}
+            />
           </Form.Item>
           <Form.Item label="熊证 Number" name="bear_warrant_code" style={{ marginBottom: 10 }}>
-            <Input placeholder="例如 61234" />
+            <Input
+              placeholder="例如 61234"
+              style={{
+                background: colors.downBg,
+                borderColor: colors.down,
+              }}
+            />
+          </Form.Item>
+          <Form.Item label="RSI 周期" name="rsi_length" style={{ marginBottom: 10, gridColumn: '1 / -1' }}>
+            <Select
+              options={[
+                { value: 6, label: '6' },
+                { value: 8, label: '8' },
+                { value: 10, label: '10' },
+                { value: 12, label: '12' },
+                { value: 14, label: '14' },
+              ]}
+            />
           </Form.Item>
           <Form.Item label="RSI 超卖" name="rsi_oversold" style={{ marginBottom: 10 }}>
             <InputNumber min={5} max={40} style={{ width: '100%' }} />

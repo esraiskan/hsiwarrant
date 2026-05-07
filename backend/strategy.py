@@ -13,7 +13,7 @@ from typing import Callable, Optional
 from config import (
     SYMBOL, ER_RATIO, SHARE_COUNT, TARGET_PNL, STOP_POINTS, EXTREME_STOP_PNL,
     BULL_WARRANT_CODE, BEAR_WARRANT_CODE,
-    RSI_OVERSOLD, RSI_OVERBOUGHT, POLL_INTERVAL, ENTRY_ORDER_WAIT_SECONDS,
+    RSI_LENGTH, RSI_OVERSOLD, RSI_OVERBOUGHT, POLL_INTERVAL, ENTRY_ORDER_WAIT_SECONDS,
     ENTRY_CUTOFF_TIME,
 )
 from models import (
@@ -131,6 +131,7 @@ class HSIStrategyEngine:
         self.target_pnl = TARGET_PNL
         self.extreme_stop_pnl = EXTREME_STOP_PNL
         self.stop_points = STOP_POINTS
+        self.rsi_length = RSI_LENGTH
         self.rsi_oversold = RSI_OVERSOLD
         self.rsi_overbought = RSI_OVERBOUGHT
         self.poll_interval = POLL_INTERVAL
@@ -191,6 +192,11 @@ class HSIStrategyEngine:
             if value is not None and hasattr(self, key):
                 if key in ("bull_warrant_code", "bear_warrant_code"):
                     setattr(self, key, normalize_warrant_code(value))
+                elif key == "rsi_length":
+                    rsi_length = int(value)
+                    if rsi_length not in (6, 8, 10, 12, 14):
+                        raise ValueError("rsi_length 只支持 6/8/10/12/14")
+                    setattr(self, key, rsi_length)
                 else:
                     setattr(self, key, value)
         if "target_pnl" in kwargs or "er_ratio" in kwargs or "share_count" in kwargs:
@@ -219,6 +225,7 @@ class HSIStrategyEngine:
             "extreme_stop_pnl": self.extreme_stop_pnl,
             "bull_warrant_code": self.bull_warrant_code,
             "bear_warrant_code": self.bear_warrant_code,
+            "rsi_length": self.rsi_length,
             "rsi_oversold": self.rsi_oversold,
             "rsi_overbought": self.rsi_overbought,
             "poll_interval": self.poll_interval,
@@ -238,6 +245,7 @@ class HSIStrategyEngine:
             "share_count",
             "target_pnl",
             "extreme_stop_pnl",
+            "rsi_length",
             "rsi_oversold",
             "rsi_overbought",
             "poll_interval",
@@ -250,6 +258,8 @@ class HSIStrategyEngine:
                 value = int(data[key])
                 if value <= 0:
                     raise ValueError(f"{key} 必须大于 0")
+                if key == "rsi_length" and value not in (6, 8, 10, 12, 14):
+                    raise ValueError("rsi_length 只支持 6/8/10/12/14")
                 setattr(self, key, value)
             for key in ("bull_warrant_code", "bear_warrant_code"):
                 if key in data:
@@ -262,6 +272,7 @@ class HSIStrategyEngine:
             self.target_pnl = TARGET_PNL
             self.extreme_stop_pnl = EXTREME_STOP_PNL
             self.stop_points = self._stop_points_for_pnl(self.target_pnl)
+            self.rsi_length = RSI_LENGTH
             self.rsi_oversold = RSI_OVERSOLD
             self.rsi_overbought = RSI_OVERBOUGHT
             self.poll_interval = POLL_INTERVAL
@@ -1038,11 +1049,11 @@ class HSIStrategyEngine:
 
         # 拉取 1 分钟 K 线 (主信号: RSI / 成交额 / VWAP / K线形态)
         df_1m = await loop.run_in_executor(
-            None, self.data_source.get_kline_with_indicators, "1m"
+            None, self.data_source.get_kline_with_indicators, "1m", self.rsi_length
         )
         # 拉取 15 分钟 K 线 (跨周期确认)
         df_15m = await loop.run_in_executor(
-            None, self.data_source.get_kline_with_indicators, "15m"
+            None, self.data_source.get_kline_with_indicators, "15m", self.rsi_length
         )
 
         # 拉取涨跌家数比 (市场情绪指标，用于后续分析)
@@ -1270,7 +1281,7 @@ class HSIStrategyEngine:
             # --- 累积趋势信号 (温水煮青蛙式单边) ---
             # 最近5根1M累积跌/涨 > 40点 + VWAP方向一致
             # 过滤条件：
-            #   1. 日内区间 >= 150点 (确认有波动)
+            #   1. 日内区间 >= 100点 (确认有波动)
             #   2. 信号方向必须和开盘以来的整体方向一致
             #   3. 涨跌家数比必须支持信号方向
             if self.position == PositionType.NONE and abs(cum5) >= 40:
@@ -1284,7 +1295,7 @@ class HSIStrategyEngine:
                 day_range = day_high - day_low
                 day_trend = price - day_open
 
-                if day_range >= 150:
+                if day_range >= 100:
                     # 做空信号：累积跌 + 当天整体也在跌
                     if cum5 < -40 and curr_slope < 0 and day_trend < 0:
                         skip_reasons = get_cum_trend_filter_reasons(

@@ -192,7 +192,7 @@ class FutuDataSource:
             print(f"[FutuData] 获取实时价格异常: {e}")
             return None
 
-    def get_kline_with_indicators(self, ktype: str = "1m") -> pd.DataFrame | None:
+    def get_kline_with_indicators(self, ktype: str = "1m", rsi_length: int = RSI_LENGTH) -> pd.DataFrame | None:
         """拉取实时 K 线并计算指标 (策略研判用)"""
         if not self.is_connected:
             if not self.connect():
@@ -217,7 +217,7 @@ class FutuDataSource:
             if len(df) < 2:
                 return None
 
-            df["RSI"] = calc_rsi(df["close"], length=RSI_LENGTH)
+            df["RSI"] = calc_rsi(df["close"], length=rsi_length)
             vol_series = df["turnover"] if "turnover" in df.columns and df["turnover"].sum() > 0 else df["volume"]
             df["VWAP"] = calc_vwap(df["high"], df["low"], df["close"], vol_series)
             df["VWAP_SLOPE"] = df["VWAP"].diff()
