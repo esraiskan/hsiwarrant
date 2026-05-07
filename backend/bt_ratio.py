@@ -32,6 +32,7 @@ def bt(d1, d15, allow_cum):
     d1["cum5"] = d1["close"].diff().rolling(5).sum()
     open_price = d1.iloc[0]["open"]
     pos = "none"; entry = 0.0; trades = []; et = ""
+    last_take_profit_side = None; last_take_profit_time = None
     for i in range(max(VOL_MA_PERIOD, RSI_LENGTH) + 1, len(d1)):
         r = d1.iloc[i]; p = d1.iloc[i-1]; t = d1.index[i]
         rsi = r["RSI"]; price = r["close"]; vol = r["vol"]; vma = r["VOL_MA"]
@@ -62,11 +63,14 @@ def bt(d1, d15, allow_cum):
             if not sig and allow_cum and abs(cum5) >= 30 and day_range >= 150:
                 if cum5 < -30 and cs < 0 and day_trend < 0 and rsi >= RSI_OVERSOLD: sig = ("bear", "Cum")
                 elif cum5 > 30 and cs > 0 and day_trend > 0 and rsi <= RSI_OVERBOUGHT: sig = ("bull", "Cum")
+            if sig and last_take_profit_side == sig[0] and last_take_profit_time is not None:
+                if (t - last_take_profit_time).total_seconds() < 180:
+                    sig = None
             if sig: pos = sig[0]; entry = price; et = t.strftime("%H:%M")
         else:
             diff = (price - entry) if pos == "bull" else (entry - price)
             pnl = (diff / ER_RATIO) * SHARE_COUNT
-            if diff >= STOP_POINTS: trades.append(dict(r="W", pnl=pnl)); pos = "none"
+            if diff >= STOP_POINTS: trades.append(dict(r="W", pnl=pnl)); last_take_profit_side = pos; last_take_profit_time = t; pos = "none"
             elif diff <= -STOP_POINTS: trades.append(dict(r="L", pnl=pnl)); pos = "none"
     w = sum(1 for x in trades if x["r"] == "W"); lo = sum(1 for x in trades if x["r"] == "L")
     return len(trades), w, lo, sum(x["pnl"] for x in trades) if trades else 0

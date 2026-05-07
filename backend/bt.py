@@ -57,6 +57,7 @@ print("TP/SL: +/-%s pts = +/-%s HKD" % (STOP_POINTS, TARGET_PNL))
 print("=" * 70)
 
 pos = "none"; entry = 0.0; trades = []; et = ""
+last_take_profit_side = None; last_take_profit_time = None
 start_idx = max(VOL_MA_PERIOD, RSI_LENGTH) + 1
 
 for i in range(start_idx, len(d1)):
@@ -100,6 +101,9 @@ for i in range(start_idx, len(d1)):
                 sig = ("bear", "CumTrend %.1f" % cum5)
             elif cum5 > 30 and cs > 0 and rsi <= RSI_OVERBOUGHT:
                 sig = ("bull", "CumTrend +%.1f" % cum5)
+        if sig and last_take_profit_side == sig[0] and last_take_profit_time is not None:
+            if (t - last_take_profit_time).total_seconds() < 180:
+                sig = None
         if sig:
             pos, desc = sig; entry = price; et = t.strftime("%H:%M")
             d_str = "BULL" if pos == "bull" else "BEAR"
@@ -111,6 +115,7 @@ for i in range(start_idx, len(d1)):
             dur = (t - pd.Timestamp("%s %s" % (today, et))).total_seconds() / 60
             trades.append(dict(r="W", pnl=pnl, d=diff, t=t.strftime("%H:%M"), tp=pos, en=entry, ex=price, dur=dur, et=et))
             print("[%s] WIN  %.2f->%.2f +%.2fpts +%.2fHKD %dmin" % (t.strftime("%H:%M"), entry, price, diff, pnl, dur))
+            last_take_profit_side = pos; last_take_profit_time = t
             pos = "none"
         elif diff <= -STOP_POINTS:
             dur = (t - pd.Timestamp("%s %s" % (today, et))).total_seconds() / 60

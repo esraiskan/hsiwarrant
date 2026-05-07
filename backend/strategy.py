@@ -71,6 +71,8 @@ TERMINAL_UNFILLED_EXIT_STATUSES = {
     "DISABLED",
 }
 EXTREME_STOP_REVERSAL_GUARD_SECONDS = 5 * 60
+SAME_SIDE_TAKE_PROFIT_COOLDOWN_SECONDS = 3 * 60
+FORCE_EXIT_TIME = "15:55"
 
 
 class HSIStrategyEngine:
@@ -108,6 +110,8 @@ class HSIStrategyEngine:
         self.last_extreme_stop_position = PositionType.NONE
         self.last_extreme_stop_time: datetime | None = None
         self.last_reversal_guard_log_key = ""
+        self.last_take_profit_position = PositionType.NONE
+        self.last_take_profit_time: datetime | None = None
 
         # 回调
         self.on_kline_update: Optional[Callable] = None
@@ -313,6 +317,8 @@ class HSIStrategyEngine:
             "last_extreme_stop_position": self.last_extreme_stop_position.value,
             "last_extreme_stop_time": self.last_extreme_stop_time.isoformat() if self.last_extreme_stop_time else "",
             "last_reversal_guard_log_key": self.last_reversal_guard_log_key,
+            "last_take_profit_position": self.last_take_profit_position.value,
+            "last_take_profit_time": self.last_take_profit_time.isoformat() if self.last_take_profit_time else "",
         }
 
     def _save_runtime_state(self):
@@ -352,6 +358,13 @@ class HSIStrategyEngine:
             last_stop_time = data.get("last_extreme_stop_time")
             self.last_extreme_stop_time = datetime.fromisoformat(last_stop_time) if last_stop_time else None
             self.last_reversal_guard_log_key = str(data.get("last_reversal_guard_log_key", ""))
+            self.last_take_profit_position = PositionType(
+                data.get("last_take_profit_position", PositionType.NONE.value)
+            )
+            last_take_profit_time = data.get("last_take_profit_time")
+            self.last_take_profit_time = (
+                datetime.fromisoformat(last_take_profit_time) if last_take_profit_time else None
+            )
             if self.position != PositionType.NONE and (
                 not self.current_warrant_code or not self.exit_order_id or self.warrant_entry_price <= 0
             ):
@@ -442,6 +455,8 @@ class HSIStrategyEngine:
         self.total_pnl_hkd += pnl_hkd
         if pnl_hkd >= 0:
             self.win_count += 1
+            self.last_take_profit_position = old_position
+            self.last_take_profit_time = datetime.now()
         else:
             self.loss_count += 1
         self.trade_count = max(self.trade_count, self.win_count + self.loss_count)
@@ -491,6 +506,18 @@ class HSIStrategyEngine:
         self.last_extreme_stop_position = PositionType.NONE
         self.last_extreme_stop_time = None
         self.last_reversal_guard_log_key = ""
+
+    def _same_side_take_profit_cooldown_remaining(self, side: PositionType) -> int:
+        if (
+            side == PositionType.NONE
+            or self.last_take_profit_position != side
+            or self.last_take_profit_time is None
+        ):
+            return 0
+
+        elapsed = (datetime.now() - self.last_take_profit_time).total_seconds()
+        remaining = SAME_SIDE_TAKE_PROFIT_COOLDOWN_SECONDS - elapsed
+        return max(0, int(remaining))
 
     def _update_extreme_stop_reversal_guard(
         self,
@@ -566,6 +593,10 @@ class HSIStrategyEngine:
         time_part = current_time[11:16] if len(current_time) >= 16 else current_time[:5]
         return time_part >= self.entry_cutoff_time
 
+    def _is_after_force_exit_time(self, current_time: str) -> bool:
+        time_part = current_time[11:16] if len(current_time) >= 16 else current_time[:5]
+        return time_part >= FORCE_EXIT_TIME
+
     async def _cancel_pending_entry_after_cutoff(self, current_time: str, hsi_price: float, rsi: float):
         if not self.pending_buy_order_id:
             return
@@ -584,6 +615,71 @@ class HSIStrategyEngine:
         self._reset_order_state()
         self._save_runtime_state()
 
+    async def _force_exit_position_after_cutoff(self, current_time: str, hsi_price: float, rsi: float):
+        if self.position == PositionType.NONE or not self.current_warrant_code:
+            return
+
+        order = self.trader.get_order(self.exit_order_id) if self.exit_order_id else None
+        if order is not None and _is_filled_all(order.get("order_status", "")):
+            await self._finalize_exit_fill(order, hsi_price, rsi)
+            return
+        if self.stop_loss_order_sent:
+            return
+
+        exit_price, reason = self._get_stop_exit_price(self.current_warrant_code)
+        if exit_price is None:
+            await self._emit_trade_record(TradeRecord(
+                time=current_time,
+                signal=TradeSignal.STOP_LOSS_PENDING,
+                price=hsi_price,
+                rsi=round(rsi, 2),
+                position=self.position,
+                message=f"15:55强制平仓失败: {reason} | order_id:{self.exit_order_id or '-'}",
+            ))
+            return
+
+        if order is not None and self._is_terminal_unfilled_exit_status(order.get("order_status", "")):
+            remain_qty = self._remaining_exit_qty(order)
+            if remain_qty <= 0:
+                await self._mark_exit_complete_from_order(order, current_time, hsi_price, rsi)
+                return
+            result = self.trader.place_order(self.current_warrant_code, exit_price, remain_qty, "SELL")
+            action = "卖单失效，已按最新 buy1 补挂强平卖单"
+        elif self.exit_order_id:
+            target_qty = float(order.get("qty", self.warrant_qty or self.share_count)) if order else float(self.warrant_qty or self.share_count)
+            result = self.trader.modify_order(self.exit_order_id, exit_price, target_qty)
+            action = "已改现有卖单到最新 buy1 强平"
+        else:
+            result = self.trader.place_order(
+                self.current_warrant_code,
+                exit_price,
+                int(self.warrant_qty or self.share_count),
+                "SELL",
+            )
+            action = "已按最新 buy1 补挂强平卖单"
+
+        if result.get("success"):
+            if not self.exit_order_id or action.startswith("卖单失效") or action.startswith("已按"):
+                self.exit_order_id = result["order_id"]
+            self.stop_loss_order_sent = True
+            self.warrant_exit_price = exit_price
+            self._save_runtime_state()
+
+        dealt_qty = float(order.get("dealt_qty", 0.0)) if order else 0.0
+        remain_qty = self._remaining_exit_qty(order)
+        await self._emit_trade_record(TradeRecord(
+            time=current_time,
+            signal=TradeSignal.STOP_LOSS_PENDING,
+            price=hsi_price,
+            rsi=round(rsi, 2),
+            position=self.position,
+            message=(
+                f"15:55强制平仓，{action}: {self.current_warrant_code} "
+                f"@ {exit_price:.3f} | order_id:{self.exit_order_id or '-'} "
+                f"| 已成交:{dealt_qty:.0f} 剩余:{remain_qty} | {result.get('message')}"
+            ),
+        ))
+
     async def _submit_entry_order(
         self,
         side: PositionType,
@@ -596,10 +692,23 @@ class HSIStrategyEngine:
         if self.position != PositionType.NONE or self.pending_buy_order_id:
             return
 
+        label = "牛证" if side == PositionType.BULL else "熊证"
+        cooldown_remaining = self._same_side_take_profit_cooldown_remaining(side)
+        if cooldown_remaining > 0:
+            suffix = f" | {extra_message}" if extra_message else ""
+            await self._emit_trade_record(TradeRecord(
+                time=current_time, signal=TradeSignal.ENTRY_PENDING, price=hsi_price, rsi=round(rsi, 2),
+                position=side,
+                message=(
+                    f"【{label}·{mode}】跳过: 同方向止盈后冷却中 "
+                    f"remaining:{cooldown_remaining}s{suffix}"
+                ),
+            ))
+            return
+
         raw_code = self.bull_warrant_code if side == PositionType.BULL else self.bear_warrant_code
         code = normalize_warrant_code(raw_code)
         signal = TradeSignal.BUY_BULL if side == PositionType.BULL else TradeSignal.BUY_BEAR
-        label = "牛证" if side == PositionType.BULL else "熊证"
         if not code:
             await self._emit_trade_record(TradeRecord(
                 time=current_time, signal=TradeSignal.ENTRY_PENDING, price=hsi_price, rsi=round(rsi, 2),
@@ -1163,6 +1272,13 @@ class HSIStrategyEngine:
 
         await self._monitor_entry_order(current_time, price, rsi)
         await self._monitor_exit_order(current_time, price, rsi)
+
+        if self._is_after_force_exit_time(current_time):
+            await self._cancel_pending_entry_after_cutoff(current_time, price, rsi)
+            await self._force_exit_position_after_cutoff(current_time, price, rsi)
+            if self.on_state_update:
+                await self.on_state_update(self.get_state())
+            return
 
         print(f"[{current_time}] 价格:{price:.2f} RSI:{rsi:.2f} "
               f"VWAP:{vwap_status}({curr_slope:.2f}/{prev_slope:.2f}) "
