@@ -5,6 +5,33 @@ from futu import OpenQuoteContext, RET_OK, KLType, AuType, SubType
 from config import FUTU_HOST, FUTU_PORT, SYMBOL, RSI_LENGTH, VOL_MA_PERIOD
 from config import ER_RATIO, SHARE_COUNT, STOP_POINTS, TARGET_PNL
 from config import RSI_OVERSOLD, RSI_OVERBOUGHT
+from trend_filter import (
+    CUM_TREND_BOUNDARY_POINTS,
+    get_cum_trend_boundary_filter_reasons,
+)
+
+EXTREME_VOLUME_SURGE_MULTIPLIER = 1.4
+VERY_EXTREME_RSI_OVERBOUGHT = 82
+VERY_EXTREME_RSI_OVERSOLD = 16
+VERY_EXTREME_VOLUME_SURGE_MULTIPLIER = 1.25
+VERY_EXTREME_PULLBACK_POINTS = 3.0
+MOMENTUM_VOLUME_SURGE_MULTIPLIER = 1.5
+MOMENTUM_MIN_K_BODY_POINTS = 5.0
+MOMENTUM_MAX_K_BODY_POINTS = 30.0
+
+
+def extreme_signal(rsi, ratio, price, high, low):
+    if rsi < RSI_OVERSOLD and ratio > EXTREME_VOLUME_SURGE_MULTIPLIER:
+        return "bull", "ExtremeLow RSI:%.1f %.2fx" % (rsi, ratio)
+    if rsi > RSI_OVERBOUGHT and ratio > EXTREME_VOLUME_SURGE_MULTIPLIER:
+        return "bear", "ExtremeHigh RSI:%.1f %.2fx" % (rsi, ratio)
+    if ratio <= VERY_EXTREME_VOLUME_SURGE_MULTIPLIER:
+        return None
+    if rsi <= VERY_EXTREME_RSI_OVERSOLD and price >= low + VERY_EXTREME_PULLBACK_POINTS:
+        return "bull", "VeryExtremeLowPullback RSI:%.1f %.2fx" % (rsi, ratio)
+    if rsi >= VERY_EXTREME_RSI_OVERBOUGHT and price <= high - VERY_EXTREME_PULLBACK_POINTS:
+        return "bear", "VeryExtremeHighPullback RSI:%.1f %.2fx" % (rsi, ratio)
+    return None
 
 def calc_rsi(s, n=14):
     d = s.diff()
@@ -78,17 +105,19 @@ for i in range(start_idx, len(d1)):
     if len(m15c) == 0: continue
     m15 = m15c.iloc[-1]
     m15g = m15["close"] > m15["open"]; m15r = m15["close"] < m15["open"]
-    k_chg = r["close"] - r["open"]; vol_surge = vol > vma * 1.5
+    k_chg = r["close"] - r["open"]
+    momentum_ratio = vol / vma if vma > 0 else 0.0
+    momentum_body_ok = MOMENTUM_MIN_K_BODY_POINTS <= abs(k_chg) <= MOMENTUM_MAX_K_BODY_POINTS
+    extreme_sig = extreme_signal(rsi, momentum_ratio, price, r["high"], r["low"]) if k_chg != 0 and momentum_body_ok else None
+    vol_surge = vol > vma * MOMENTUM_VOLUME_SURGE_MULTIPLIER
     cum5 = r["cum5"] if not isnan(r["cum5"]) else 0
 
     if pos == "none":
         sig = None
-        if rsi < RSI_OVERSOLD and vol_hi:
-            sig = ("bull", "ExtremeLow RSI:%.1f" % rsi)
+        if extreme_sig:
+            sig = extreme_sig
         elif RSI_OVERSOLD <= rsi < 25 and vwap_up and vol_hi and bull_pat and m15g:
             sig = ("bull", "NormalLow RSI:%.1f" % rsi)
-        elif rsi > RSI_OVERBOUGHT and vol_hi:
-            sig = ("bear", "ExtremeHigh RSI:%.1f" % rsi)
         elif 75 < rsi <= RSI_OVERBOUGHT and vwap_dn and vol_hi and bear_pat and m15r:
             sig = ("bear", "NormalHigh RSI:%.1f" % rsi)
         if not sig:
@@ -97,10 +126,28 @@ for i in range(start_idx, len(d1)):
             elif vol_surge and k_chg < -10 and cs < 0:
                 sig = ("bear", "Momentum %.1f %.1fx" % (k_chg, vol/vma))
         if not sig:
-            if cum5 < -30 and cs < 0 and rsi >= RSI_OVERSOLD:
-                sig = ("bear", "CumTrend %.1f" % cum5)
-            elif cum5 > 30 and cs > 0 and rsi <= RSI_OVERBOUGHT:
-                sig = ("bull", "CumTrend +%.1f" % cum5)
+            recent = d1.iloc[max(0, i-5):i+1]
+            recent_low = recent["low"].min()
+            recent_high = recent["high"].max()
+            prev_close = p["close"]
+            if cum5 < -CUM_TREND_BOUNDARY_POINTS and cs < 0 and rsi >= RSI_OVERSOLD:
+                boundary_reasons = get_cum_trend_boundary_filter_reasons(
+                    "bear", float(cum5), float(rsi), float(prev_close), float(price),
+                    float(recent_low), float(recent_high), RSI_OVERSOLD, RSI_OVERBOUGHT,
+                )
+                if boundary_reasons:
+                    sig = None
+                else:
+                    sig = ("bear", "CumTrend %.1f" % cum5)
+            elif cum5 > CUM_TREND_BOUNDARY_POINTS and cs > 0 and rsi <= RSI_OVERBOUGHT:
+                boundary_reasons = get_cum_trend_boundary_filter_reasons(
+                    "bull", float(cum5), float(rsi), float(prev_close), float(price),
+                    float(recent_low), float(recent_high), RSI_OVERSOLD, RSI_OVERBOUGHT,
+                )
+                if boundary_reasons:
+                    sig = None
+                else:
+                    sig = ("bull", "CumTrend +%.1f" % cum5)
         if sig and last_take_profit_side == sig[0] and last_take_profit_time is not None:
             if (t - last_take_profit_time).total_seconds() < 180:
                 sig = None

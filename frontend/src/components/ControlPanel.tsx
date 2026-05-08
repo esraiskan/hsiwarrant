@@ -187,6 +187,9 @@ export default function ControlPanel({ isRunning, actionLoading, onConfigLoaded,
           <Form.Item label="目标盈亏 (HKD)" name="target_pnl" style={{ marginBottom: 10 }}>
             <InputNumber min={100} max={10000} step={100} style={{ width: '100%' }} />
           </Form.Item>
+          <Form.Item label="开仓数量" name="share_count" style={{ marginBottom: 10 }}>
+            <InputNumber min={1} step={1000} style={{ width: '100%' }} />
+          </Form.Item>
           <Form.Item label="极度止损 (HKD)" name="extreme_stop_pnl" style={{ marginBottom: 10 }}>
             <InputNumber min={100} max={10000} step={100} style={{ width: '100%' }} />
           </Form.Item>
