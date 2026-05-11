@@ -86,6 +86,7 @@ class ConfigResponse(BaseModel):
     poll_interval: int
     entry_order_wait_seconds: int
     entry_cutoff_time: str
+    only_extreme_entries: bool
 
 
 class ConfigUpdate(BaseModel):
@@ -101,6 +102,7 @@ class ConfigUpdate(BaseModel):
     vol_ma_period: Optional[int] = None
     poll_interval: Optional[int] = None
     entry_order_wait_seconds: Optional[int] = None
+    only_extreme_entries: Optional[bool] = None
 
 
 class TradeEnvUpdate(BaseModel):

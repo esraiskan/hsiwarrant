@@ -82,6 +82,7 @@ export interface StrategyConfig {
   poll_interval: number;
   entry_order_wait_seconds: number;
   entry_cutoff_time: string;
+  only_extreme_entries: boolean;
 }
 
 /** OpenD 连接状态 */

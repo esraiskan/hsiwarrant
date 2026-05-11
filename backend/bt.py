@@ -11,9 +11,10 @@ from trend_filter import (
 )
 
 EXTREME_VOLUME_SURGE_MULTIPLIER = 1.4
-VERY_EXTREME_RSI_OVERBOUGHT = 82
+VERY_EXTREME_RSI_OVERBOUGHT = 85
 VERY_EXTREME_RSI_OVERSOLD = 16
 VERY_EXTREME_VOLUME_SURGE_MULTIPLIER = 1.25
+VERY_EXTREME_AVG_VOLUME_MULTIPLIER = 1.0
 VERY_EXTREME_PULLBACK_POINTS = 3.0
 MOMENTUM_VOLUME_SURGE_MULTIPLIER = 1.5
 MOMENTUM_MIN_K_BODY_POINTS = 5.0
@@ -25,7 +26,7 @@ def extreme_signal(rsi, ratio, price, high, low):
         return "bull", "ExtremeLow RSI:%.1f %.2fx" % (rsi, ratio)
     if rsi > RSI_OVERBOUGHT and ratio > EXTREME_VOLUME_SURGE_MULTIPLIER:
         return "bear", "ExtremeHigh RSI:%.1f %.2fx" % (rsi, ratio)
-    if ratio <= VERY_EXTREME_VOLUME_SURGE_MULTIPLIER:
+    if ratio <= VERY_EXTREME_AVG_VOLUME_MULTIPLIER:
         return None
     if rsi <= VERY_EXTREME_RSI_OVERSOLD and price >= low + VERY_EXTREME_PULLBACK_POINTS:
         return "bull", "VeryExtremeLowPullback RSI:%.1f %.2fx" % (rsi, ratio)

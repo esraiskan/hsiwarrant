@@ -56,49 +56,49 @@ class CompletedExtremeSignalTest(unittest.TestCase):
         )
         self.assertEqual(side, PositionType.NONE)
 
-    def test_completed_extreme_overbought_blocks_below_dynamic_volume(self):
+    def test_completed_extreme_overbought_blocks_below_average_volume(self):
         row = {
-            "RSI": 83.5,
+            "RSI": 85.5,
             "open": 26460.89,
             "high": 26470.49,
             "low": 26460.89,
             "close": 26467.23,
-            "volume": 992_000_000.0,
+            "volume": 792_000_000.0,
             "VOL_MA": 800_000_000.0,
         }
         side, _ = self.engine._completed_extreme_signal(
-            row, current_price=26467.00, current_rsi=83.0
+            row, current_price=26467.00, current_rsi=85.0
         )
         self.assertEqual(side, PositionType.NONE)
 
     def test_completed_extreme_overbought_allows_dynamic_pullback(self):
         row = {
-            "RSI": 83.5,
+            "RSI": 85.5,
             "open": 26460.89,
             "high": 26470.49,
             "low": 26460.89,
             "close": 26467.23,
-            "volume": 1_008_000_000.0,
+            "volume": 840_000_000.0,
             "VOL_MA": 800_000_000.0,
         }
         side, message = self.engine._completed_extreme_signal(
-            row, current_price=26467.49, current_rsi=83.0
+            row, current_price=26467.49, current_rsi=85.0
         )
         self.assertEqual(side, PositionType.BEAR)
-        self.assertIn("非常极端RSI低量补捉", message)
+        self.assertIn("非常极端RSI均量回落", message)
 
     def test_completed_extreme_overbought_blocks_dynamic_without_pullback(self):
         row = {
-            "RSI": 83.5,
+            "RSI": 85.5,
             "open": 26460.89,
             "high": 26470.49,
             "low": 26460.89,
             "close": 26467.23,
-            "volume": 1_008_000_000.0,
+            "volume": 840_000_000.0,
             "VOL_MA": 800_000_000.0,
         }
         side, _ = self.engine._completed_extreme_signal(
-            row, current_price=26468.00, current_rsi=83.0
+            row, current_price=26468.00, current_rsi=85.0
         )
         self.assertEqual(side, PositionType.NONE)
 
@@ -109,7 +109,7 @@ class CompletedExtremeSignalTest(unittest.TestCase):
             "high": 26470.49,
             "low": 26460.89,
             "close": 26467.23,
-            "volume": 1_008_000_000.0,
+            "volume": 840_000_000.0,
             "VOL_MA": 800_000_000.0,
         }
         side, _ = self.engine._completed_extreme_signal(

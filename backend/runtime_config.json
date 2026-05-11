@@ -1,13 +1,14 @@
 {
   "er_ratio": 10000,
   "share_count": 200000,
-  "target_pnl": 200,
-  "extreme_stop_pnl": 500,
-  "bull_warrant_code": "HK.54598",
-  "bear_warrant_code": "HK.68376",
+  "target_pnl": 400,
+  "extreme_stop_pnl": 1000,
+  "bull_warrant_code": "HK.53780",
+  "bear_warrant_code": "HK.54955",
   "rsi_length": 6,
-  "rsi_oversold": 26,
-  "rsi_overbought": 72,
+  "rsi_oversold": 22,
+  "rsi_overbought": 75,
   "poll_interval": 2,
-  "entry_order_wait_seconds": 40
+  "entry_order_wait_seconds": 40,
+  "only_extreme_entries": false
 }

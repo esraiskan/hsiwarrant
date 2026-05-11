@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Button, Input, InputNumber, Form, Select, message } from 'antd';
+import { Button, Input, InputNumber, Form, Select, Switch, message } from 'antd';
 import {
   PlayCircleOutlined,
   PauseCircleOutlined,
@@ -131,6 +131,7 @@ export default function ControlPanel({ isRunning, actionLoading, onConfigLoaded,
               ['开仓数量', `${config.share_count.toLocaleString()} 份`],
               ['RSI 周期', `${config.rsi_length}`],
               ['掛單等待', `${config.entry_order_wait_seconds} 秒`],
+              ['入場限制', config.only_extreme_entries ? '只買極度' : '全部模式'],
               ['牛证', config.bull_warrant_code ? `${config.bull_warrant_code} ${config.bull_warrant_name || ''}` : '未设置'],
               ['熊证', config.bear_warrant_code ? `${config.bear_warrant_code} ${config.bear_warrant_name || ''}` : '未设置'],
             ].map(([label, value]) => (
@@ -198,6 +199,14 @@ export default function ControlPanel({ isRunning, actionLoading, onConfigLoaded,
           </Form.Item>
           <Form.Item label="掛單等待 (秒)" name="entry_order_wait_seconds" style={{ marginBottom: 10 }}>
             <InputNumber min={5} max={300} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item
+            label="只買極度超買/超賣"
+            name="only_extreme_entries"
+            valuePropName="checked"
+            style={{ marginBottom: 10 }}
+          >
+            <Switch />
           </Form.Item>
         </div>
         <Button

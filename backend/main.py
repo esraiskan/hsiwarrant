@@ -137,6 +137,7 @@ async def get_config():
         poll_interval=engine.poll_interval,
         entry_order_wait_seconds=engine.entry_order_wait_seconds,
         entry_cutoff_time=engine.entry_cutoff_time,
+        only_extreme_entries=engine.only_extreme_entries,
     )
 
 

@@ -65,10 +65,13 @@ def _order_status_name(status: str) -> str:
 EXTREME_ENTRY_MODES = {"极度超卖", "极度超买"}
 MOMENTUM_ENTRY_MODE = "放量动能"
 CUM_TREND_ENTRY_MODE = "累积趋势"
+CUM_TREND_RSI_BUFFER = 3.0
+CUM_TREND_PENDING_ADVERSE_MOVE_POINTS = 5.0
 EXTREME_VOLUME_SURGE_MULTIPLIER = 1.4
-VERY_EXTREME_RSI_OVERBOUGHT = 82
+VERY_EXTREME_RSI_OVERBOUGHT = 85
 VERY_EXTREME_RSI_OVERSOLD = 16
 VERY_EXTREME_VOLUME_SURGE_MULTIPLIER = 1.25
+VERY_EXTREME_AVG_VOLUME_MULTIPLIER = 1.0
 VERY_EXTREME_PULLBACK_POINTS = 3.0
 MOMENTUM_VOLUME_SURGE_MULTIPLIER = 1.5
 MOMENTUM_MIN_K_BODY_POINTS = 5.0
@@ -103,18 +106,18 @@ def _extreme_signal_side(
     if rsi > rsi_overbought and momentum_ratio > EXTREME_VOLUME_SURGE_MULTIPLIER:
         return PositionType.BEAR, False, "放量动能触发"
 
-    if momentum_ratio <= VERY_EXTREME_VOLUME_SURGE_MULTIPLIER:
+    if momentum_ratio <= VERY_EXTREME_AVG_VOLUME_MULTIPLIER:
         return PositionType.NONE, False, ""
     if (
         rsi <= VERY_EXTREME_RSI_OVERSOLD
         and current_price >= k_low + VERY_EXTREME_PULLBACK_POINTS
     ):
-        return PositionType.BULL, True, "非常极端RSI低量补捉"
+        return PositionType.BULL, True, "非常极端RSI均量反抽"
     if (
         rsi >= VERY_EXTREME_RSI_OVERBOUGHT
         and current_price <= k_high - VERY_EXTREME_PULLBACK_POINTS
     ):
-        return PositionType.BEAR, True, "非常极端RSI低量补捉"
+        return PositionType.BEAR, True, "非常极端RSI均量回落"
     return PositionType.NONE, False, ""
 
 
@@ -186,6 +189,7 @@ class HSIStrategyEngine:
         self.poll_interval = POLL_INTERVAL
         self.entry_order_wait_seconds = ENTRY_ORDER_WAIT_SECONDS
         self.entry_cutoff_time = ENTRY_CUTOFF_TIME
+        self.only_extreme_entries = False
         self.bull_warrant_code = BULL_WARRANT_CODE
         self.bear_warrant_code = BEAR_WARRANT_CODE
         self._load_runtime_config()
@@ -279,6 +283,7 @@ class HSIStrategyEngine:
             "rsi_overbought": self.rsi_overbought,
             "poll_interval": self.poll_interval,
             "entry_order_wait_seconds": self.entry_order_wait_seconds,
+            "only_extreme_entries": self.only_extreme_entries,
         }
 
     def _save_runtime_config(self):
@@ -313,6 +318,8 @@ class HSIStrategyEngine:
             for key in ("bull_warrant_code", "bear_warrant_code"):
                 if key in data:
                     setattr(self, key, normalize_warrant_code(data.get(key)))
+            if "only_extreme_entries" in data:
+                self.only_extreme_entries = bool(data["only_extreme_entries"])
             self.stop_points = self._stop_points_for_pnl(self.target_pnl)
         except Exception as e:
             print(f"[RuntimeConfig] 配置内容无效，使用默认配置: {e}")
@@ -326,6 +333,7 @@ class HSIStrategyEngine:
             self.rsi_overbought = RSI_OVERBOUGHT
             self.poll_interval = POLL_INTERVAL
             self.entry_order_wait_seconds = ENTRY_ORDER_WAIT_SECONDS
+            self.only_extreme_entries = False
             self.bull_warrant_code = BULL_WARRANT_CODE
             self.bear_warrant_code = BEAR_WARRANT_CODE
 
@@ -737,6 +745,65 @@ class HSIStrategyEngine:
         self._reset_order_state()
         self._save_runtime_state()
 
+    async def _cancel_degraded_cum_trend_entry(
+        self,
+        current_time: str,
+        hsi_price: float,
+        rsi: float,
+        curr_slope: float,
+        cum5: float,
+    ) -> bool:
+        if (
+            self.entry_mode != CUM_TREND_ENTRY_MODE
+            or not self.pending_buy_order_id
+            or self.position != PositionType.NONE
+            or self.momentum_entry_trigger_price <= 0
+        ):
+            return False
+
+        side = self.pending_entry_side
+        trigger_price = self.momentum_entry_trigger_price
+        adverse_move = 0.0
+        reasons: list[str] = []
+        if side == PositionType.BEAR:
+            adverse_move = hsi_price - trigger_price
+            if adverse_move >= CUM_TREND_PENDING_ADVERSE_MOVE_POINTS:
+                reasons.append(f"反弹{adverse_move:.1f}点")
+            if cum5 >= -CUM_TREND_BOUNDARY_POINTS:
+                reasons.append(f"累跌收窄 cum5:{cum5:.1f}")
+            if curr_slope >= 0:
+                reasons.append("VWAP斜率不再向下")
+        elif side == PositionType.BULL:
+            adverse_move = trigger_price - hsi_price
+            if adverse_move >= CUM_TREND_PENDING_ADVERSE_MOVE_POINTS:
+                reasons.append(f"回落{adverse_move:.1f}点")
+            if cum5 <= CUM_TREND_BOUNDARY_POINTS:
+                reasons.append(f"累涨收窄 cum5:{cum5:.1f}")
+            if curr_slope <= 0:
+                reasons.append("VWAP斜率不再向上")
+        else:
+            return False
+
+        if not reasons:
+            return False
+
+        result = self.trader.cancel_order(self.pending_buy_order_id)
+        await self._emit_trade_record(TradeRecord(
+            time=current_time,
+            signal=TradeSignal.ENTRY_PENDING,
+            price=hsi_price,
+            rsi=round(rsi, 2),
+            position=PositionType.NONE,
+            message=(
+                f"累积趋势买入挂单期间信号退化，已取消: "
+                f"order_id:{self.pending_buy_order_id} | 触发价:{trigger_price:.2f} "
+                f"| {'; '.join(reasons)} | {result.get('message')}"
+            ),
+        ))
+        self._reset_order_state()
+        self._save_runtime_state()
+        return True
+
     async def _force_exit_position_after_cutoff(self, current_time: str, hsi_price: float, rsi: float):
         if self.position == PositionType.NONE or not self.current_warrant_code:
             return
@@ -815,6 +882,14 @@ class HSIStrategyEngine:
             return
 
         label = "牛证" if side == PositionType.BULL else "熊证"
+        if self.only_extreme_entries and mode not in EXTREME_ENTRY_MODES:
+            await self._emit_trade_record(TradeRecord(
+                time=current_time, signal=TradeSignal.ENTRY_PENDING, price=hsi_price, rsi=round(rsi, 2),
+                position=side,
+                message=f"【{label}·{mode}】跳过: 已开启只买极度超买/超卖",
+            ))
+            return
+
         cooldown_remaining = self._same_side_take_profit_cooldown_remaining(side)
         if cooldown_remaining > 0:
             remaining_minutes = max(1, math.ceil(cooldown_remaining / 60))
@@ -866,7 +941,7 @@ class HSIStrategyEngine:
         self.warrant_tick_size = snapshot["price_spread"]
         self.warrant_qty = float(self.share_count)
         self.entry_mode = mode
-        self.momentum_entry_trigger_price = hsi_price if mode == MOMENTUM_ENTRY_MODE else 0.0
+        self.momentum_entry_trigger_price = hsi_price if mode in {MOMENTUM_ENTRY_MODE, CUM_TREND_ENTRY_MODE} else 0.0
         self._save_runtime_state()
 
         suffix = f" | {extra_message}" if extra_message else ""
@@ -1009,6 +1084,32 @@ class HSIStrategyEngine:
             if snapshot is None:
                 return
             new_price = snapshot["bid_price"]
+            price_decimals = _price_decimals(snapshot["price_spread"])
+            current_order_price = float(order.get("price", 0.0))
+            price_unchanged = (
+                current_order_price > 0
+                and round(new_price, price_decimals) == round(current_order_price, price_decimals)
+            )
+            if self.entry_mode == MOMENTUM_ENTRY_MODE and price_unchanged:
+                if elapsed < self.entry_order_wait_seconds * 2:
+                    return
+                result = self.trader.cancel_order(self.pending_buy_order_id)
+                await self._emit_trade_record(TradeRecord(
+                    time=current_time,
+                    signal=TradeSignal.ENTRY_PENDING,
+                    price=hsi_price,
+                    rsi=round(rsi, 2),
+                    position=PositionType.NONE,
+                    message=(
+                        f"放量动能买入未成交，最新 buy1 未变，不追价并取消今轮信号: "
+                        f"{self.current_warrant_code} @ {new_price:.3f} "
+                        f"| order_id:{self.pending_buy_order_id} | {result.get('message')}"
+                    ),
+                ))
+                self._reset_order_state()
+                self._save_runtime_state()
+                return
+
             result = self.trader.modify_order(
                 self.pending_buy_order_id,
                 new_price,
@@ -1445,6 +1546,11 @@ class HSIStrategyEngine:
                 await self.on_state_update(self.get_state())
             return
 
+        if await self._cancel_degraded_cum_trend_entry(current_time, price, rsi, curr_slope, cum5):
+            if self.on_state_update:
+                await self.on_state_update(self.get_state())
+            return
+
         if self.position == PositionType.NONE:
             # --- 牛证 ---
             # 普通超卖 (18 <= RSI < 25): 需要全部5个条件
@@ -1459,7 +1565,7 @@ class HSIStrategyEngine:
                 )
 
             # --- 熊证 ---
-            # 普通超买 (75 < RSI <= 82): 需要全部5个条件
+            # 普通超买 (75 < RSI <= 85): 需要全部5个条件
             elif rsi > 75:
                 bear_normal = (75 < rsi <= self.rsi_overbought
                                and vwap_turning_down and vol_is_high
@@ -1593,10 +1699,10 @@ class HSIStrategyEngine:
                 if day_range >= 100:
                     # 做空信号：累积跌 + 当天整体也在跌
                     if cum5 < -CUM_TREND_BOUNDARY_POINTS and curr_slope < 0 and day_trend < 0:
-                        if rsi < self.rsi_oversold:
+                        if rsi < self.rsi_oversold + CUM_TREND_RSI_BUFFER:
                             print(
                                 f"  >>> Skip bear cumtrend: RSI extreme oversold "
-                                f"rsi={rsi:.2f} threshold={self.rsi_oversold:.2f}"
+                                f"rsi={rsi:.2f} threshold={self.rsi_oversold + CUM_TREND_RSI_BUFFER:.2f}"
                             )
                         else:
                             skip_reasons = get_cum_trend_filter_reasons("bear", breadth_ratio)
@@ -1626,10 +1732,10 @@ class HSIStrategyEngine:
 
                     # 做多信号：累积涨 + 当天整体也在涨
                     elif cum5 > CUM_TREND_BOUNDARY_POINTS and curr_slope > 0 and day_trend > 0:
-                        if rsi > self.rsi_overbought:
+                        if rsi > self.rsi_overbought - CUM_TREND_RSI_BUFFER:
                             print(
                                 f"  >>> Skip bull cumtrend: RSI extreme overbought "
-                                f"rsi={rsi:.2f} threshold={self.rsi_overbought:.2f}"
+                                f"rsi={rsi:.2f} threshold={self.rsi_overbought - CUM_TREND_RSI_BUFFER:.2f}"
                             )
                         else:
                             skip_reasons = get_cum_trend_filter_reasons("bull", breadth_ratio)

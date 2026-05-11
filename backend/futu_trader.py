@@ -3,6 +3,8 @@
 负责在模拟盘/真实盘下单、查询持仓、查询订单
 """
 import json
+import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -15,6 +17,9 @@ from config import FUTU_HOST, FUTU_PORT
 
 TRADE_ENV_STATE_PATH = Path(__file__).with_name("trade_env_state.json")
 HK_TZ = timezone(timedelta(hours=8), name="Asia/Hong_Kong")
+ORDER_QUERY_WINDOW_SECONDS = 30.0
+ORDER_QUERY_MAX_PER_WINDOW = 9
+ORDER_QUERY_MIN_INTERVAL_SECONDS = 3.2
 
 
 def _today_hk() -> str:
@@ -63,6 +68,8 @@ class FutuTrader:
         self._connected = False
         self._real_unlocked_date: str | None = None
         self.trd_env = _to_trd_env(self._load_trade_env())
+        self._order_cache: dict[str, dict] = {}
+        self._order_query_times: dict[str, deque[float]] = {}
 
     def _load_trade_env(self) -> str:
         """读取当天交易环境；过期或无状态时回到模拟盘。"""
@@ -178,6 +185,27 @@ class FutuTrader:
     def is_connected(self) -> bool:
         return self._connected and self.trade_ctx is not None
 
+    def _allow_order_query(self, order_id: str) -> bool:
+        now = time.monotonic()
+        query_times = self._order_query_times.setdefault(order_id, deque())
+        while query_times and now - query_times[0] >= ORDER_QUERY_WINDOW_SECONDS:
+            query_times.popleft()
+        if query_times and now - query_times[-1] < ORDER_QUERY_MIN_INTERVAL_SECONDS:
+            return False
+        if len(query_times) >= ORDER_QUERY_MAX_PER_WINDOW:
+            return False
+        query_times.append(now)
+        return True
+
+    def _cached_order(self, order_id: str) -> dict | None:
+        cached = self._order_cache.get(order_id)
+        return dict(cached) if cached else None
+
+    def _clear_order_query_state(self, order_id: str):
+        order_id = str(order_id)
+        self._order_cache.pop(order_id, None)
+        self._order_query_times.pop(order_id, None)
+
     def place_order(self, code: str, price: float, qty: int, side: str, order_type=OrderType.NORMAL) -> dict:
         """
         下单
@@ -237,6 +265,7 @@ class FutuTrader:
                 print(f"[FutuTrader] 改单失败: {data}")
                 return {"success": False, "message": str(data)}
             print(f"[FutuTrader] 改单成功: order_id={order_id} qty={qty} price={price}")
+            self._clear_order_query_state(order_id)
             return {"success": True, "message": "改单成功"}
         except Exception as e:
             print(f"[FutuTrader] 改单异常: {e}")
@@ -259,6 +288,7 @@ class FutuTrader:
                 print(f"[FutuTrader] 撤单失败: {data}")
                 return {"success": False, "message": str(data)}
             print(f"[FutuTrader] 撤单成功: order_id={order_id}")
+            self._clear_order_query_state(order_id)
             return {"success": True, "message": "撤单成功"}
         except Exception as e:
             print(f"[FutuTrader] 撤单异常: {e}")
@@ -266,6 +296,9 @@ class FutuTrader:
 
     def get_order(self, order_id: str) -> dict | None:
         """查询单张订单。"""
+        order_id = str(order_id)
+        if not self._allow_order_query(order_id):
+            return self._cached_order(order_id)
         if not self.is_connected:
             if not self.connect():
                 return None
@@ -277,9 +310,9 @@ class FutuTrader:
             )
             if ret != RET_OK or data is None or data.empty:
                 print(f"[FutuTrader] 查询订单失败: {order_id} {data}")
-                return None
+                return self._cached_order(order_id)
             row = data.iloc[0]
-            return {
+            order = {
                 "order_id": str(row.get("order_id", "")),
                 "code": str(row.get("code", "")),
                 "name": str(row.get("stock_name", "")),
@@ -293,9 +326,11 @@ class FutuTrader:
                 "create_time": str(row.get("create_time", "")),
                 "updated_time": str(row.get("updated_time", "")),
             }
+            self._order_cache[order_id] = order
+            return dict(order)
         except Exception as e:
             print(f"[FutuTrader] 查询订单异常: {e}")
-            return None
+            return self._cached_order(order_id)
 
     def get_positions(self) -> list[dict]:
         """查询当前持仓"""
