@@ -12,7 +12,7 @@ from strategy import (
 
 class VolumeThresholdTest(unittest.TestCase):
     def test_extreme_and_momentum_use_separate_volume_thresholds(self):
-        self.assertEqual(EXTREME_VOLUME_SURGE_MULTIPLIER, 1.4)
+        self.assertEqual(EXTREME_VOLUME_SURGE_MULTIPLIER, 1.3)
         self.assertEqual(VERY_EXTREME_VOLUME_SURGE_MULTIPLIER, 1.25)
         self.assertEqual(VERY_EXTREME_AVG_VOLUME_MULTIPLIER, 1.0)
         self.assertEqual(MOMENTUM_VOLUME_SURGE_MULTIPLIER, 1.5)

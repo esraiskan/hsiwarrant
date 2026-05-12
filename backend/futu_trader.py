@@ -294,10 +294,10 @@ class FutuTrader:
             print(f"[FutuTrader] 撤单异常: {e}")
             return {"success": False, "message": str(e)}
 
-    def get_order(self, order_id: str) -> dict | None:
+    def get_order(self, order_id: str, force_refresh: bool = False) -> dict | None:
         """查询单张订单。"""
         order_id = str(order_id)
-        if not self._allow_order_query(order_id):
+        if not force_refresh and not self._allow_order_query(order_id):
             return self._cached_order(order_id)
         if not self.is_connected:
             if not self.connect():

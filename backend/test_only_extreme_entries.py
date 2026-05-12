@@ -11,6 +11,8 @@ class OnlyExtremeEntriesTest(unittest.TestCase):
     def setUp(self):
         self.engine = HSIStrategyEngine()
         self.records = []
+        self.engine._reset_order_state()
+        self.engine.position = PositionType.NONE
 
         async def capture_record(record):
             self.records.append(record)

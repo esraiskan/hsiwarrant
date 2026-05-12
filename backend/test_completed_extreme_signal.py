@@ -1,7 +1,11 @@
 import unittest
 
 from models import PositionType
-from strategy import HSIStrategyEngine
+from strategy import (
+    HSIStrategyEngine,
+    VERY_EXTREME_SHADOW_BEAR_ENTRY_MODE,
+    VERY_EXTREME_SHADOW_BULL_ENTRY_MODE,
+)
 
 
 class CompletedExtremeSignalTest(unittest.TestCase):
@@ -53,6 +57,100 @@ class CompletedExtremeSignalTest(unittest.TestCase):
         }
         side, _ = self.engine._completed_extreme_signal(
             row, current_price=26295.0, current_rsi=20.0
+        )
+        self.assertEqual(side, PositionType.NONE)
+
+    def test_completed_extreme_allows_very_extreme_lower_shadow_bull(self):
+        row = {
+            "RSI": 9.25,
+            "open": 26505.55,
+            "high": 26505.55,
+            "low": 26492.04,
+            "close": 26501.91,
+            "volume": 654_264_662.918,
+            "VOL_MA": 624_427_914.62,
+        }
+        side, message = self.engine._completed_extreme_signal(
+            row, current_price=26502.93, current_rsi=9.25
+        )
+        self.assertEqual(side, PositionType.BULL)
+        self.assertIn(VERY_EXTREME_SHADOW_BULL_ENTRY_MODE, message)
+        self.assertIn("低位反抽9.9点", message)
+
+    def test_completed_extreme_shadow_bull_blocks_if_chasing_too_far(self):
+        row = {
+            "RSI": 9.25,
+            "open": 26505.55,
+            "high": 26505.55,
+            "low": 26492.04,
+            "close": 26501.91,
+            "volume": 654_264_662.918,
+            "VOL_MA": 624_427_914.62,
+        }
+        side, _ = self.engine._completed_extreme_signal(
+            row, current_price=26506.50, current_rsi=9.25
+        )
+        self.assertEqual(side, PositionType.NONE)
+
+    def test_completed_extreme_shadow_bull_blocks_without_enough_lower_shadow(self):
+        row = {
+            "RSI": 9.25,
+            "open": 26502.10,
+            "high": 26505.55,
+            "low": 26498.50,
+            "close": 26501.91,
+            "volume": 654_264_662.918,
+            "VOL_MA": 624_427_914.62,
+        }
+        side, _ = self.engine._completed_extreme_signal(
+            row, current_price=26502.93, current_rsi=9.25
+        )
+        self.assertEqual(side, PositionType.NONE)
+
+    def test_completed_extreme_allows_very_extreme_upper_shadow_bear(self):
+        row = {
+            "RSI": 91.25,
+            "open": 26505.55,
+            "high": 26515.96,
+            "low": 26505.55,
+            "close": 26506.02,
+            "volume": 654_264_662.918,
+            "VOL_MA": 624_427_914.62,
+        }
+        side, message = self.engine._completed_extreme_signal(
+            row, current_price=26505.20, current_rsi=91.25
+        )
+        self.assertEqual(side, PositionType.BEAR)
+        self.assertIn(VERY_EXTREME_SHADOW_BEAR_ENTRY_MODE, message)
+        self.assertIn("高位回落9.9点", message)
+
+    def test_completed_extreme_shadow_bear_blocks_if_chasing_too_far(self):
+        row = {
+            "RSI": 91.25,
+            "open": 26505.55,
+            "high": 26515.96,
+            "low": 26505.55,
+            "close": 26506.02,
+            "volume": 654_264_662.918,
+            "VOL_MA": 624_427_914.62,
+        }
+        side, _ = self.engine._completed_extreme_signal(
+            row, current_price=26501.50, current_rsi=91.25
+        )
+        self.assertEqual(side, PositionType.NONE)
+
+    def test_completed_extreme_shadow_bear_blocks_without_enough_upper_shadow(self):
+        row = {
+            "RSI": 91.25,
+            "open": 26505.55,
+            "high": 26508.00,
+            "low": 26500.00,
+            "close": 26506.02,
+            "volume": 654_264_662.918,
+            "VOL_MA": 624_427_914.62,
+        }
+        side, _ = self.engine._completed_extreme_signal(
+            row, current_price=26505.20, current_rsi=91.25
         )
         self.assertEqual(side, PositionType.NONE)
 

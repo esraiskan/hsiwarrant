@@ -62,17 +62,39 @@ def _order_status_name(status: str) -> str:
     return str(status or "").upper().split(".")[-1]
 
 
-EXTREME_ENTRY_MODES = {"极度超卖", "极度超买"}
+VERY_EXTREME_SHADOW_BULL_ENTRY_MODE = "非常极端下影反抽"
+VERY_EXTREME_SHADOW_BEAR_ENTRY_MODE = "非常极端上影回落"
+EXTREME_ENTRY_MODES = {
+    "极度超卖",
+    "极度超买",
+    VERY_EXTREME_SHADOW_BULL_ENTRY_MODE,
+    VERY_EXTREME_SHADOW_BEAR_ENTRY_MODE,
+}
 MOMENTUM_ENTRY_MODE = "放量动能"
 CUM_TREND_ENTRY_MODE = "累积趋势"
 CUM_TREND_RSI_BUFFER = 3.0
 CUM_TREND_PENDING_ADVERSE_MOVE_POINTS = 5.0
-EXTREME_VOLUME_SURGE_MULTIPLIER = 1.4
+CUM_TREND_VWAP_CONFIRM_BARS = 2
+CUM_TREND_SAME_SIDE_STOP_COOLDOWN_SECONDS = 180
+CUM_TREND_BULL_OVERHEAT_RSI = 70.0
+CUM_TREND_BULL_PULLBACK_RSI = 68.0
+CUM_TREND_BEAR_OVERSOLD_RSI = 30.0
+CUM_TREND_BEAR_REBOUND_RSI = 32.0
+MOMENTUM_PENDING_ADVERSE_MOVE_POINTS = 5.0
+EXTREME_VOLUME_SURGE_MULTIPLIER = 1.3
 VERY_EXTREME_RSI_OVERBOUGHT = 85
 VERY_EXTREME_RSI_OVERSOLD = 16
 VERY_EXTREME_VOLUME_SURGE_MULTIPLIER = 1.25
 VERY_EXTREME_AVG_VOLUME_MULTIPLIER = 1.0
 VERY_EXTREME_PULLBACK_POINTS = 3.0
+VERY_EXTREME_SHADOW_BULL_RSI = 10.0
+VERY_EXTREME_SHADOW_BEAR_RSI = 90.0
+VERY_EXTREME_SHADOW_MIN_REBOUND_POINTS = 8.0
+VERY_EXTREME_SHADOW_MIN_LOWER_SHADOW_POINTS = 6.0
+VERY_EXTREME_SHADOW_MIN_PULLBACK_POINTS = 8.0
+VERY_EXTREME_SHADOW_MIN_UPPER_SHADOW_POINTS = 6.0
+VERY_EXTREME_SHADOW_MIN_VOLUME_RATIO = 1.0
+VERY_EXTREME_SHADOW_MAX_ENTRY_CHASE_POINTS = 4.0
 MOMENTUM_VOLUME_SURGE_MULTIPLIER = 1.5
 MOMENTUM_MIN_K_BODY_POINTS = 5.0
 MOMENTUM_MAX_K_BODY_POINTS = 30.0
@@ -160,6 +182,9 @@ class HSIStrategyEngine:
         self.last_take_profit_time: datetime | None = None
         self.last_take_profit_cooldown_log_key = ""
         self.last_completed_extreme_kline_time = ""
+        self.last_cum_trend_trigger_key = ""
+        self.last_cum_trend_stop_position = PositionType.NONE
+        self.last_cum_trend_stop_time: datetime | None = None
 
         # 回调
         self.on_kline_update: Optional[Callable] = None
@@ -382,6 +407,9 @@ class HSIStrategyEngine:
             "last_take_profit_position": self.last_take_profit_position.value,
             "last_take_profit_time": self.last_take_profit_time.isoformat() if self.last_take_profit_time else "",
             "last_completed_extreme_kline_time": self.last_completed_extreme_kline_time,
+            "last_cum_trend_trigger_key": self.last_cum_trend_trigger_key,
+            "last_cum_trend_stop_position": self.last_cum_trend_stop_position.value,
+            "last_cum_trend_stop_time": self.last_cum_trend_stop_time.isoformat() if self.last_cum_trend_stop_time else "",
         }
 
     def _save_runtime_state(self):
@@ -429,6 +457,14 @@ class HSIStrategyEngine:
                 datetime.fromisoformat(last_take_profit_time) if last_take_profit_time else None
             )
             self.last_completed_extreme_kline_time = str(data.get("last_completed_extreme_kline_time", ""))
+            self.last_cum_trend_trigger_key = str(data.get("last_cum_trend_trigger_key", ""))
+            self.last_cum_trend_stop_position = PositionType(
+                data.get("last_cum_trend_stop_position", PositionType.NONE.value)
+            )
+            last_cum_stop_time = data.get("last_cum_trend_stop_time")
+            self.last_cum_trend_stop_time = (
+                datetime.fromisoformat(last_cum_stop_time) if last_cum_stop_time else None
+            )
             if self.position != PositionType.NONE and (
                 not self.current_warrant_code or not self.exit_order_id or self.warrant_entry_price <= 0
             ):
@@ -524,6 +560,7 @@ class HSIStrategyEngine:
         else:
             self.loss_count += 1
         self.trade_count = max(self.trade_count, self.win_count + self.loss_count)
+        self._mark_cum_trend_stop_if_needed(old_entry_mode, old_position, pnl_hkd)
         self._update_extreme_stop_reversal_guard(old_entry_mode, old_position, pnl_hkd)
         self.position = PositionType.NONE
         self.entry_price = 0.0
@@ -583,6 +620,92 @@ class HSIStrategyEngine:
         remaining = SAME_SIDE_TAKE_PROFIT_COOLDOWN_SECONDS - elapsed
         return max(0, int(remaining))
 
+    def _cum_trend_stop_cooldown_remaining(self, side: PositionType) -> int:
+        if (
+            side == PositionType.NONE
+            or self.last_cum_trend_stop_position != side
+            or self.last_cum_trend_stop_time is None
+        ):
+            return 0
+
+        elapsed = (datetime.now() - self.last_cum_trend_stop_time).total_seconds()
+        remaining = CUM_TREND_SAME_SIDE_STOP_COOLDOWN_SECONDS - elapsed
+        return max(0, int(remaining))
+
+    def _mark_cum_trend_stop_if_needed(
+        self,
+        entry_mode: str,
+        side: PositionType,
+        pnl_hkd: float,
+    ):
+        if entry_mode != CUM_TREND_ENTRY_MODE or side == PositionType.NONE or pnl_hkd >= 0:
+            return
+        self.last_cum_trend_stop_position = side
+        self.last_cum_trend_stop_time = datetime.now()
+
+    def _cum_trend_trigger_key(self, signal_kline_time: str, side: PositionType) -> str:
+        return f"{signal_kline_time}:{side.value}"
+
+    def _is_duplicate_cum_trend_signal(self, signal_kline_time: str, side: PositionType) -> bool:
+        return self.last_cum_trend_trigger_key == self._cum_trend_trigger_key(signal_kline_time, side)
+
+    def _mark_cum_trend_signal_submitted(self, signal_kline_time: str, side: PositionType):
+        self.last_cum_trend_trigger_key = self._cum_trend_trigger_key(signal_kline_time, side)
+        self._save_runtime_state()
+
+    def _completed_cum5(self, df_1m) -> float:
+        if len(df_1m) < 7:
+            return 0.0
+        completed = df_1m.iloc[:-1]
+        recent_closes = [completed.iloc[j]["close"] for j in range(len(completed) - 6, len(completed))]
+        return float(recent_closes[-1] - recent_closes[0])
+
+    def _completed_vwap_slopes_confirm(self, df_1m, side: PositionType) -> bool:
+        if len(df_1m) < CUM_TREND_VWAP_CONFIRM_BARS + 1:
+            return False
+        completed = df_1m.iloc[:-1]
+        slopes = completed.tail(CUM_TREND_VWAP_CONFIRM_BARS)["VWAP_SLOPE"]
+        if any(_is_nan(value) for value in slopes):
+            return False
+        if side == PositionType.BULL:
+            return all(float(value) > 0 for value in slopes)
+        if side == PositionType.BEAR:
+            return all(float(value) < 0 for value in slopes)
+        return False
+
+    def _cum_trend_entry_block_reasons(
+        self,
+        side: PositionType,
+        signal_kline_time: str,
+        completed_rsi: float,
+        df_1m,
+    ) -> list[str]:
+        reasons: list[str] = []
+        if self._is_duplicate_cum_trend_signal(signal_kline_time, side):
+            reasons.append(f"同K线已尝试: {signal_kline_time}")
+
+        cooldown_remaining = self._cum_trend_stop_cooldown_remaining(side)
+        if cooldown_remaining > 0:
+            reasons.append(f"同方向累积趋势止损后冷却中 remaining:{cooldown_remaining}s")
+
+        if not self._completed_vwap_slopes_confirm(df_1m, side):
+            direction = "向上" if side == PositionType.BULL else "向下"
+            reasons.append(f"VWAP未连续{direction}")
+
+        if side == PositionType.BULL and completed_rsi > CUM_TREND_BULL_PULLBACK_RSI:
+            label = "RSI过热" if completed_rsi >= CUM_TREND_BULL_OVERHEAT_RSI else "RSI未回踩"
+            reasons.append(
+                f"{label}等待回踩 rsi={completed_rsi:.2f} "
+                f"resume<={CUM_TREND_BULL_PULLBACK_RSI:.0f}"
+            )
+        elif side == PositionType.BEAR and completed_rsi < CUM_TREND_BEAR_REBOUND_RSI:
+            label = "RSI过冷" if completed_rsi <= CUM_TREND_BEAR_OVERSOLD_RSI else "RSI未反弹"
+            reasons.append(
+                f"{label}等待反弹 rsi={completed_rsi:.2f} "
+                f"resume>={CUM_TREND_BEAR_REBOUND_RSI:.0f}"
+            )
+        return reasons
+
     def _completed_extreme_signal(
         self,
         row,
@@ -603,6 +726,34 @@ class HSIStrategyEngine:
         k_body_points = abs(k_change)
         if k_change == 0:
             return PositionType.NONE, ""
+
+        shadow_side, shadow_message = self._completed_very_extreme_shadow_bull_signal(
+            row,
+            current_price,
+            current_rsi,
+            close,
+            open_price,
+            low,
+            vol,
+            vol_ma,
+            rsi,
+        )
+        if shadow_side != PositionType.NONE:
+            return shadow_side, shadow_message
+        shadow_side, shadow_message = self._completed_very_extreme_shadow_bear_signal(
+            row,
+            current_price,
+            current_rsi,
+            close,
+            open_price,
+            high,
+            vol,
+            vol_ma,
+            rsi,
+        )
+        if shadow_side != PositionType.NONE:
+            return shadow_side, shadow_message
+
         if not (MOMENTUM_MIN_K_BODY_POINTS <= k_body_points <= MOMENTUM_MAX_K_BODY_POINTS):
             return PositionType.NONE, ""
 
@@ -648,6 +799,82 @@ class HSIStrategyEngine:
             )
 
         return PositionType.NONE, ""
+
+    def _completed_very_extreme_shadow_bull_signal(
+        self,
+        row,
+        current_price: float,
+        current_rsi: float,
+        close: float,
+        open_price: float,
+        low: float,
+        vol: float,
+        vol_ma: float,
+        rsi: float,
+    ) -> tuple[PositionType, str]:
+        if rsi > VERY_EXTREME_SHADOW_BULL_RSI:
+            return PositionType.NONE, ""
+
+        momentum_ratio = vol / vol_ma
+        if momentum_ratio < VERY_EXTREME_SHADOW_MIN_VOLUME_RATIO:
+            return PositionType.NONE, ""
+
+        lower_shadow = min(open_price, close) - low
+        rebound_from_low = close - low
+        if lower_shadow < VERY_EXTREME_SHADOW_MIN_LOWER_SHADOW_POINTS:
+            return PositionType.NONE, ""
+        if rebound_from_low < VERY_EXTREME_SHADOW_MIN_REBOUND_POINTS:
+            return PositionType.NONE, ""
+
+        move_from_signal = current_price - close
+        if move_from_signal > VERY_EXTREME_SHADOW_MAX_ENTRY_CHASE_POINTS:
+            return PositionType.NONE, ""
+        if current_rsi > VERY_EXTREME_SHADOW_BULL_RSI + EXTREME_COMPLETED_K_RSI_BUFFER:
+            return PositionType.NONE, ""
+
+        return PositionType.BULL, (
+            f"上一根完成K触发 | {VERY_EXTREME_SHADOW_BULL_ENTRY_MODE} | RSI:{rsi:.2f} | "
+            f"低位反抽{rebound_from_low:.1f}点 | 下影{lower_shadow:.1f}点 | "
+            f"{momentum_ratio:.2f}x量 | 当前偏离:{move_from_signal:+.1f}点"
+        )
+
+    def _completed_very_extreme_shadow_bear_signal(
+        self,
+        row,
+        current_price: float,
+        current_rsi: float,
+        close: float,
+        open_price: float,
+        high: float,
+        vol: float,
+        vol_ma: float,
+        rsi: float,
+    ) -> tuple[PositionType, str]:
+        if rsi < VERY_EXTREME_SHADOW_BEAR_RSI:
+            return PositionType.NONE, ""
+
+        momentum_ratio = vol / vol_ma
+        if momentum_ratio < VERY_EXTREME_SHADOW_MIN_VOLUME_RATIO:
+            return PositionType.NONE, ""
+
+        upper_shadow = high - max(open_price, close)
+        pullback_from_high = high - close
+        if upper_shadow < VERY_EXTREME_SHADOW_MIN_UPPER_SHADOW_POINTS:
+            return PositionType.NONE, ""
+        if pullback_from_high < VERY_EXTREME_SHADOW_MIN_PULLBACK_POINTS:
+            return PositionType.NONE, ""
+
+        move_from_signal = current_price - close
+        if move_from_signal < -VERY_EXTREME_SHADOW_MAX_ENTRY_CHASE_POINTS:
+            return PositionType.NONE, ""
+        if current_rsi < VERY_EXTREME_SHADOW_BEAR_RSI - EXTREME_COMPLETED_K_RSI_BUFFER:
+            return PositionType.NONE, ""
+
+        return PositionType.BEAR, (
+            f"上一根完成K触发 | {VERY_EXTREME_SHADOW_BEAR_ENTRY_MODE} | RSI:{rsi:.2f} | "
+            f"高位回落{pullback_from_high:.1f}点 | 上影{upper_shadow:.1f}点 | "
+            f"{momentum_ratio:.2f}x量 | 当前偏离:{move_from_signal:+.1f}点"
+        )
 
     def _update_extreme_stop_reversal_guard(
         self,
@@ -730,6 +957,10 @@ class HSIStrategyEngine:
     async def _cancel_pending_entry_after_cutoff(self, current_time: str, hsi_price: float, rsi: float):
         if not self.pending_buy_order_id:
             return
+        order = self.trader.get_order(self.pending_buy_order_id, force_refresh=True)
+        if order is not None and _is_filled_all(order.get("order_status", "")):
+            await self._monitor_entry_order(current_time, hsi_price, rsi)
+            return
         result = self.trader.cancel_order(self.pending_buy_order_id)
         await self._emit_trade_record(TradeRecord(
             time=current_time,
@@ -787,6 +1018,11 @@ class HSIStrategyEngine:
         if not reasons:
             return False
 
+        order = self.trader.get_order(self.pending_buy_order_id, force_refresh=True)
+        if order is not None and _is_filled_all(order.get("order_status", "")):
+            await self._monitor_entry_order(current_time, hsi_price, rsi)
+            return True
+
         result = self.trader.cancel_order(self.pending_buy_order_id)
         await self._emit_trade_record(TradeRecord(
             time=current_time,
@@ -796,6 +1032,64 @@ class HSIStrategyEngine:
             position=PositionType.NONE,
             message=(
                 f"累积趋势买入挂单期间信号退化，已取消: "
+                f"order_id:{self.pending_buy_order_id} | 触发价:{trigger_price:.2f} "
+                f"| {'; '.join(reasons)} | {result.get('message')}"
+            ),
+        ))
+        self._reset_order_state()
+        self._save_runtime_state()
+        return True
+
+    async def _cancel_degraded_momentum_entry(
+        self,
+        current_time: str,
+        hsi_price: float,
+        rsi: float,
+        curr_slope: float,
+    ) -> bool:
+        if (
+            self.entry_mode != MOMENTUM_ENTRY_MODE
+            or not self.pending_buy_order_id
+            or self.position != PositionType.NONE
+            or self.momentum_entry_trigger_price <= 0
+        ):
+            return False
+
+        side = self.pending_entry_side
+        trigger_price = self.momentum_entry_trigger_price
+        reasons: list[str] = []
+        if side == PositionType.BULL:
+            adverse_move = trigger_price - hsi_price
+            if adverse_move >= MOMENTUM_PENDING_ADVERSE_MOVE_POINTS:
+                reasons.append(f"回落{adverse_move:.1f}点")
+            if curr_slope <= 0:
+                reasons.append("VWAP斜率不再向上")
+        elif side == PositionType.BEAR:
+            adverse_move = hsi_price - trigger_price
+            if adverse_move >= MOMENTUM_PENDING_ADVERSE_MOVE_POINTS:
+                reasons.append(f"反弹{adverse_move:.1f}点")
+            if curr_slope >= 0:
+                reasons.append("VWAP斜率不再向下")
+        else:
+            return False
+
+        if not reasons:
+            return False
+
+        order = self.trader.get_order(self.pending_buy_order_id, force_refresh=True)
+        if order is not None and _is_filled_all(order.get("order_status", "")):
+            await self._monitor_entry_order(current_time, hsi_price, rsi)
+            return True
+
+        result = self.trader.cancel_order(self.pending_buy_order_id)
+        await self._emit_trade_record(TradeRecord(
+            time=current_time,
+            signal=TradeSignal.ENTRY_PENDING,
+            price=hsi_price,
+            rsi=round(rsi, 2),
+            position=PositionType.NONE,
+            message=(
+                f"放量动能买入挂单期间信号退化，已取消: "
                 f"order_id:{self.pending_buy_order_id} | 触发价:{trigger_price:.2f} "
                 f"| {'; '.join(reasons)} | {result.get('message')}"
             ),
@@ -877,9 +1171,9 @@ class HSIStrategyEngine:
         current_time: str,
         mode: str,
         extra_message: str = "",
-    ):
+    ) -> bool:
         if self.position != PositionType.NONE or self.pending_buy_order_id:
-            return
+            return False
 
         label = "牛证" if side == PositionType.BULL else "熊证"
         if self.only_extreme_entries and mode not in EXTREME_ENTRY_MODES:
@@ -888,7 +1182,7 @@ class HSIStrategyEngine:
                 position=side,
                 message=f"【{label}·{mode}】跳过: 已开启只买极度超买/超卖",
             ))
-            return
+            return False
 
         cooldown_remaining = self._same_side_take_profit_cooldown_remaining(side)
         if cooldown_remaining > 0:
@@ -904,7 +1198,7 @@ class HSIStrategyEngine:
                         f"remaining:{remaining_minutes}分钟"
                     ),
                 ))
-            return
+            return False
 
         raw_code = self.bull_warrant_code if side == PositionType.BULL else self.bear_warrant_code
         code = normalize_warrant_code(raw_code)
@@ -914,7 +1208,7 @@ class HSIStrategyEngine:
                 time=current_time, signal=TradeSignal.ENTRY_PENDING, price=hsi_price, rsi=round(rsi, 2),
                 position=side, message=f"【{label}·{mode}】未下单: 未配置{label} number",
             ))
-            return
+            return False
 
         snapshot = self.data_source.get_security_snapshot(code)
         if snapshot is None:
@@ -922,7 +1216,7 @@ class HSIStrategyEngine:
                 time=current_time, signal=TradeSignal.ENTRY_PENDING, price=hsi_price, rsi=round(rsi, 2),
                 position=side, message=f"【{label}·{mode}】未下单: {code} 买一/卖一/价差无效",
             ))
-            return
+            return False
 
         buy_price = snapshot["bid_price"]
         result = self.trader.place_order(code, buy_price, self.share_count, "BUY")
@@ -931,7 +1225,7 @@ class HSIStrategyEngine:
                 time=current_time, signal=TradeSignal.ENTRY_PENDING, price=hsi_price, rsi=round(rsi, 2),
                 position=side, message=f"【{label}·{mode}】买入挂单失败: {code} @ {buy_price:.3f} | {result.get('message')}",
             ))
-            return
+            return False
 
         self.current_warrant_code = code
         self.pending_entry_side = side
@@ -953,6 +1247,7 @@ class HSIStrategyEngine:
                 f"@ {buy_price:.3f} | order_id:{self.pending_buy_order_id}{suffix}"
             ),
         ))
+        return True
 
     async def _monitor_entry_order(self, current_time: str, hsi_price: float, rsi: float):
         if not self.pending_buy_order_id:
@@ -1500,11 +1795,12 @@ class HSIStrategyEngine:
         m15_is_red = curr_15m["close"] < curr_15m["open"]
         m15_change = curr_15m["close"] - curr_15m["open"]
 
-        # 5. 累积涨跌幅 (最近5根1M K线)
+        # 5. 累积涨跌幅。日志保留实时值；累积趋势入场另用完成K线计算。
         cum5 = 0.0
         if len(df_1m) >= 6:
             recent_closes = [df_1m.iloc[j]["close"] for j in range(len(df_1m)-6, len(df_1m))]
             cum5 = recent_closes[-1] - recent_closes[0]
+        completed_cum5 = self._completed_cum5(df_1m)
 
         breadth_ratio = None
         if snapshot:
@@ -1546,7 +1842,12 @@ class HSIStrategyEngine:
                 await self.on_state_update(self.get_state())
             return
 
-        if await self._cancel_degraded_cum_trend_entry(current_time, price, rsi, curr_slope, cum5):
+        if await self._cancel_degraded_momentum_entry(current_time, price, rsi, curr_slope):
+            if self.on_state_update:
+                await self.on_state_update(self.get_state())
+            return
+
+        if await self._cancel_degraded_cum_trend_entry(current_time, price, rsi, curr_slope, completed_cum5):
             if self.on_state_update:
                 await self.on_state_update(self.get_state())
             return
@@ -1665,7 +1966,15 @@ class HSIStrategyEngine:
                     if completed_side != PositionType.NONE:
                         self.last_completed_extreme_kline_time = completed_kline_time
                         self._save_runtime_state()
-                        completed_mode = "极度超卖" if completed_side == PositionType.BULL else "极度超买"
+                        completed_mode = (
+                            VERY_EXTREME_SHADOW_BULL_ENTRY_MODE
+                            if "非常极端下影反抽" in completed_message
+                            else (
+                                VERY_EXTREME_SHADOW_BEAR_ENTRY_MODE
+                                if "非常极端上影回落" in completed_message
+                                else ("极度超卖" if completed_side == PositionType.BULL else "极度超买")
+                            )
+                        )
                         await self._submit_entry_order(
                             completed_side,
                             price,
@@ -1682,7 +1991,7 @@ class HSIStrategyEngine:
             #   2. 信号方向必须和开盘以来的整体方向一致
             #   3. 涨跌家数比必须支持信号方向
             #   4. 30-40点边界单必须有额外延续确认
-            if self.position == PositionType.NONE and abs(cum5) > CUM_TREND_BOUNDARY_POINTS:
+            if self.position == PositionType.NONE and abs(completed_cum5) > CUM_TREND_BOUNDARY_POINTS:
                 day_open = float(snapshot.get("open_price", 0)) if snapshot else 0.0
                 day_high = float(snapshot.get("high_price", 0)) if snapshot else 0.0
                 day_low = float(snapshot.get("low_price", 0)) if snapshot else 0.0
@@ -1692,25 +2001,34 @@ class HSIStrategyEngine:
                     day_low = float(df_1m["low"].min())
                 day_range = day_high - day_low
                 day_trend = price - day_open
-                recent_low = float(df_1m.tail(6)["low"].min()) if len(df_1m) >= 6 else None
-                recent_high = float(df_1m.tail(6)["high"].max()) if len(df_1m) >= 6 else None
+                completed_window = df_1m.iloc[:-1].tail(6)
+                recent_low = float(completed_window["low"].min()) if len(completed_window) >= 6 else None
+                recent_high = float(completed_window["high"].max()) if len(completed_window) >= 6 else None
                 prev_close = float(prev_1m["close"])
+                signal_kline_time = df_1m.index[-2].strftime("%Y-%m-%d %H:%M:%S")
+                completed_rsi = float(prev_1m["RSI"])
 
                 if day_range >= 100:
                     # 做空信号：累积跌 + 当天整体也在跌
-                    if cum5 < -CUM_TREND_BOUNDARY_POINTS and curr_slope < 0 and day_trend < 0:
-                        if rsi < self.rsi_oversold + CUM_TREND_RSI_BUFFER:
+                    if completed_cum5 < -CUM_TREND_BOUNDARY_POINTS and day_trend < 0:
+                        if completed_rsi < self.rsi_oversold + CUM_TREND_RSI_BUFFER:
                             print(
                                 f"  >>> Skip bear cumtrend: RSI extreme oversold "
-                                f"rsi={rsi:.2f} threshold={self.rsi_oversold + CUM_TREND_RSI_BUFFER:.2f}"
+                                f"rsi={completed_rsi:.2f} threshold={self.rsi_oversold + CUM_TREND_RSI_BUFFER:.2f}"
                             )
                         else:
+                            side = PositionType.BEAR
                             skip_reasons = get_cum_trend_filter_reasons("bear", breadth_ratio)
                             skip_reasons.extend(
                                 get_cum_trend_boundary_filter_reasons(
-                                    "bear", float(cum5), float(rsi), prev_close,
+                                    "bear", float(completed_cum5), float(completed_rsi), prev_close,
                                     float(price), recent_low, recent_high,
                                     float(self.rsi_oversold), float(self.rsi_overbought),
+                                )
+                            )
+                            skip_reasons.extend(
+                                self._cum_trend_entry_block_reasons(
+                                    side, signal_kline_time, completed_rsi, df_1m
                                 )
                             )
                             if skip_reasons:
@@ -1725,25 +2043,36 @@ class HSIStrategyEngine:
                                     )
                                     return
                                 ratio = breadth_ratio
-                                await self._submit_entry_order(
-                                    PositionType.BEAR, price, rsi, current_time, "累积趋势",
-                                    extra_message=f"5根累跌{cum5:.1f}点 | 日内{day_range:.0f}点 | R:{ratio:.2f}",
+                                submitted = await self._submit_entry_order(
+                                    side, price, completed_rsi, signal_kline_time, "累积趋势",
+                                    extra_message=(
+                                        f"5根累跌{completed_cum5:.1f}点 | "
+                                        f"日内{day_range:.0f}点 | R:{ratio:.2f}"
+                                    ),
                                 )
+                                if submitted:
+                                    self._mark_cum_trend_signal_submitted(signal_kline_time, side)
 
                     # 做多信号：累积涨 + 当天整体也在涨
-                    elif cum5 > CUM_TREND_BOUNDARY_POINTS and curr_slope > 0 and day_trend > 0:
-                        if rsi > self.rsi_overbought - CUM_TREND_RSI_BUFFER:
+                    elif completed_cum5 > CUM_TREND_BOUNDARY_POINTS and day_trend > 0:
+                        if completed_rsi > self.rsi_overbought - CUM_TREND_RSI_BUFFER:
                             print(
                                 f"  >>> Skip bull cumtrend: RSI extreme overbought "
-                                f"rsi={rsi:.2f} threshold={self.rsi_overbought - CUM_TREND_RSI_BUFFER:.2f}"
+                                f"rsi={completed_rsi:.2f} threshold={self.rsi_overbought - CUM_TREND_RSI_BUFFER:.2f}"
                             )
                         else:
+                            side = PositionType.BULL
                             skip_reasons = get_cum_trend_filter_reasons("bull", breadth_ratio)
                             skip_reasons.extend(
                                 get_cum_trend_boundary_filter_reasons(
-                                    "bull", float(cum5), float(rsi), prev_close,
+                                    "bull", float(completed_cum5), float(completed_rsi), prev_close,
                                     float(price), recent_low, recent_high,
                                     float(self.rsi_oversold), float(self.rsi_overbought),
+                                )
+                            )
+                            skip_reasons.extend(
+                                self._cum_trend_entry_block_reasons(
+                                    side, signal_kline_time, completed_rsi, df_1m
                                 )
                             )
                             if skip_reasons:
@@ -1758,10 +2087,15 @@ class HSIStrategyEngine:
                                     )
                                     return
                                 ratio = breadth_ratio
-                                await self._submit_entry_order(
-                                    PositionType.BULL, price, rsi, current_time, "累积趋势",
-                                    extra_message=f"5根累涨{cum5:.1f}点 | 日内{day_range:.0f}点 | R:{ratio:.2f}",
+                                submitted = await self._submit_entry_order(
+                                    side, price, completed_rsi, signal_kline_time, "累积趋势",
+                                    extra_message=(
+                                        f"5根累涨{completed_cum5:.1f}点 | "
+                                        f"日内{day_range:.0f}点 | R:{ratio:.2f}"
+                                    ),
                                 )
+                                if submitted:
+                                    self._mark_cum_trend_signal_submitted(signal_kline_time, side)
 
         else:
             # 止盈止损
