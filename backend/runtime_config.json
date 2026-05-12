@@ -6,9 +6,9 @@
   "bull_warrant_code": "HK.53588",
   "bear_warrant_code": "HK.67682",
   "rsi_length": 6,
-  "rsi_oversold": 22,
+  "rsi_oversold": 21,
   "rsi_overbought": 75,
   "poll_interval": 2,
-  "entry_order_wait_seconds": 40,
+  "entry_order_wait_seconds": 30,
   "only_extreme_entries": false
 }

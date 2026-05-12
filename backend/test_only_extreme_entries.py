@@ -44,6 +44,7 @@ class OnlyExtremeEntriesTest(unittest.TestCase):
         self.engine.bull_warrant_code = "HK.12345"
         self.engine.data_source.get_security_snapshot = MagicMock(return_value={
             "bid_price": 0.052,
+            "ask_price": 0.053,
             "price_spread": 0.001,
         })
         self.engine.trader.place_order = MagicMock(return_value={
@@ -59,6 +60,10 @@ class OnlyExtremeEntriesTest(unittest.TestCase):
             mode="极度超卖",
         ))
 
+        self.engine.data_source.get_security_snapshot.assert_called_once_with(
+            "HK.12345",
+            include_order_book=True,
+        )
         self.engine.trader.place_order.assert_called_once_with("HK.12345", 0.052, self.engine.share_count, "BUY")
         self.assertEqual(self.engine.pending_buy_order_id, "ORDER-1")
 

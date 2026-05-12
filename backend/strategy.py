@@ -101,6 +101,11 @@ MOMENTUM_MAX_K_BODY_POINTS = 30.0
 EXTREME_COMPLETED_K_MAX_ADVERSE_MOVE_POINTS = 8.0
 EXTREME_COMPLETED_K_MAX_FAVORABLE_MOVE_POINTS = 12.0
 EXTREME_COMPLETED_K_RSI_BUFFER = 5.0
+EXTREME_ENTRY_FIRST_WAIT_SECONDS = 10
+EXTREME_ENTRY_CHASE_WAIT_SECONDS = 12
+EXTREME_ENTRY_BOOK_BUY_RATIO = 0.70
+EXTREME_ENTRY_ASK_THIN_RATIO = 0.35
+EXTREME_ENTRY_CONFIRM_POINTS = 5.0
 TERMINAL_UNFILLED_EXIT_STATUSES = {
     "CANCELLED_ALL",
     "CANCELLED_PART",
@@ -619,6 +624,76 @@ class HSIStrategyEngine:
         elapsed = (datetime.now() - self.last_take_profit_time).total_seconds()
         remaining = SAME_SIDE_TAKE_PROFIT_COOLDOWN_SECONDS - elapsed
         return max(0, int(remaining))
+
+    def _entry_wait_seconds_for_pending_order(self) -> int:
+        if self.entry_mode in EXTREME_ENTRY_MODES:
+            if self.entry_chase_count > 0:
+                return EXTREME_ENTRY_CHASE_WAIT_SECONDS
+            return EXTREME_ENTRY_FIRST_WAIT_SECONDS
+        return self.entry_order_wait_seconds
+
+    def _warrant_book_stats(self, snapshot: dict) -> dict:
+        bid = float(snapshot.get("bid_price", 0.0) or 0.0)
+        ask = float(snapshot.get("ask_price", 0.0) or 0.0)
+        tick = float(snapshot.get("price_spread", 0.0) or 0.0)
+        bid_volume = float(snapshot.get("bid_volume", 0.0) or 0.0)
+        ask_volume = float(snapshot.get("ask_volume", 0.0) or 0.0)
+        total_volume = bid_volume + ask_volume
+        buy_ratio = bid_volume / total_volume if total_volume > 0 else 0.0
+        spread_ticks = round((ask - bid) / tick) if bid > 0 and ask > 0 and tick > 0 else 0
+        return {
+            "bid": bid,
+            "ask": ask,
+            "tick": tick,
+            "bid_volume": bid_volume,
+            "ask_volume": ask_volume,
+            "buy_ratio": buy_ratio,
+            "spread_ticks": spread_ticks,
+            "has_book_volume": bid_volume > 0 and ask_volume > 0,
+        }
+
+    def _format_entry_book(self, snapshot: dict) -> str:
+        stats = self._warrant_book_stats(snapshot)
+        ratio_text = f"{stats['buy_ratio'] * 100:.1f}%" if stats["has_book_volume"] else "N/A"
+        return (
+            f"bid:{stats['bid']:.3f} ask:{stats['ask']:.3f} "
+            f"spread:{stats['spread_ticks']}格 "
+            f"bid量:{stats['bid_volume']:.0f} ask量:{stats['ask_volume']:.0f} "
+            f"買盤佔比:{ratio_text}"
+        )
+
+    def _extreme_entry_hsi_confirmed(self, side: PositionType, hsi_price: float) -> bool:
+        trigger_price = self.momentum_entry_trigger_price
+        if trigger_price <= 0:
+            return False
+        if side == PositionType.BULL:
+            return hsi_price >= trigger_price + EXTREME_ENTRY_CONFIRM_POINTS
+        if side == PositionType.BEAR:
+            return hsi_price <= trigger_price - EXTREME_ENTRY_CONFIRM_POINTS
+        return False
+
+    def _extreme_entry_one_tick_chase_price(
+        self,
+        snapshot: dict,
+        side: PositionType,
+        hsi_price: float,
+    ) -> tuple[float | None, str]:
+        stats = self._warrant_book_stats(snapshot)
+        if stats["bid"] <= 0 or stats["ask"] <= 0 or stats["tick"] <= 0:
+            return None, "買賣價或最小價位無效"
+        if stats["spread_ticks"] != 1:
+            return None, f"spread:{stats['spread_ticks']}格，唔追一格"
+        if not stats["has_book_volume"]:
+            return None, "盤口量不足，未用佔比追一格"
+        if stats["buy_ratio"] < EXTREME_ENTRY_BOOK_BUY_RATIO:
+            return None, f"買盤佔比{stats['buy_ratio'] * 100:.1f}%未達門檻"
+        if stats["ask_volume"] > stats["bid_volume"] * EXTREME_ENTRY_ASK_THIN_RATIO:
+            return None, "賣一未夠薄"
+        if not self._extreme_entry_hsi_confirmed(side, hsi_price):
+            return None, f"HSI未確認{EXTREME_ENTRY_CONFIRM_POINTS:.0f}點方向"
+
+        decimals = _price_decimals(stats["tick"])
+        return round(stats["bid"] + stats["tick"], decimals), "強買盤且賣一薄，追一格"
 
     def _cum_trend_stop_cooldown_remaining(self, side: PositionType) -> int:
         if (
@@ -1210,7 +1285,7 @@ class HSIStrategyEngine:
             ))
             return False
 
-        snapshot = self.data_source.get_security_snapshot(code)
+        snapshot = self.data_source.get_security_snapshot(code, include_order_book=mode in EXTREME_ENTRY_MODES)
         if snapshot is None:
             await self._emit_trade_record(TradeRecord(
                 time=current_time, signal=TradeSignal.ENTRY_PENDING, price=hsi_price, rsi=round(rsi, 2),
@@ -1219,11 +1294,16 @@ class HSIStrategyEngine:
             return False
 
         buy_price = snapshot["bid_price"]
+        book_message = self._format_entry_book(snapshot)
         result = self.trader.place_order(code, buy_price, self.share_count, "BUY")
         if not result.get("success"):
             await self._emit_trade_record(TradeRecord(
                 time=current_time, signal=TradeSignal.ENTRY_PENDING, price=hsi_price, rsi=round(rsi, 2),
-                position=side, message=f"【{label}·{mode}】买入挂单失败: {code} @ {buy_price:.3f} | {result.get('message')}",
+                position=side,
+                message=(
+                    f"【{label}·{mode}】买入挂单失败: {code} @ {buy_price:.3f} "
+                    f"| {book_message} | {result.get('message')}"
+                ),
             ))
             return False
 
@@ -1235,7 +1315,9 @@ class HSIStrategyEngine:
         self.warrant_tick_size = snapshot["price_spread"]
         self.warrant_qty = float(self.share_count)
         self.entry_mode = mode
-        self.momentum_entry_trigger_price = hsi_price if mode in {MOMENTUM_ENTRY_MODE, CUM_TREND_ENTRY_MODE} else 0.0
+        self.momentum_entry_trigger_price = (
+            hsi_price if mode in {MOMENTUM_ENTRY_MODE, CUM_TREND_ENTRY_MODE} or mode in EXTREME_ENTRY_MODES else 0.0
+        )
         self._save_runtime_state()
 
         suffix = f" | {extra_message}" if extra_message else ""
@@ -1244,7 +1326,8 @@ class HSIStrategyEngine:
             position=side,
             message=(
                 f"【{label}·{mode}】挂 buy1 买入: {code} x{self.share_count} "
-                f"@ {buy_price:.3f} | order_id:{self.pending_buy_order_id}{suffix}"
+                f"@ {buy_price:.3f} | {book_message} "
+                f"| order_id:{self.pending_buy_order_id}{suffix}"
             ),
         ))
         return True
@@ -1258,7 +1341,7 @@ class HSIStrategyEngine:
             if self.entry_order_time is None:
                 return
             elapsed = (datetime.now() - self.entry_order_time).total_seconds()
-            if elapsed < self.entry_order_wait_seconds * 2:
+            if elapsed < self._entry_wait_seconds_for_pending_order() * 2:
                 return
             await self._emit_trade_record(TradeRecord(
                 time=current_time,
@@ -1354,7 +1437,8 @@ class HSIStrategyEngine:
             return
 
         elapsed = (datetime.now() - self.entry_order_time).total_seconds()
-        if elapsed < self.entry_order_wait_seconds:
+        wait_seconds = self._entry_wait_seconds_for_pending_order()
+        if elapsed < wait_seconds:
             return
 
         if self.entry_chase_count == 0:
@@ -1375,16 +1459,50 @@ class HSIStrategyEngine:
                 self._save_runtime_state()
                 return
 
-            snapshot = self.data_source.get_security_snapshot(self.current_warrant_code)
+            snapshot = self.data_source.get_security_snapshot(
+                self.current_warrant_code,
+                include_order_book=self.entry_mode in EXTREME_ENTRY_MODES,
+            )
             if snapshot is None:
                 return
             new_price = snapshot["bid_price"]
+            chase_reason = "追價到最新 buy1"
+            conservative_extreme_buy1 = False
+            if self.entry_mode in EXTREME_ENTRY_MODES:
+                chase_price, chase_reason = self._extreme_entry_one_tick_chase_price(
+                    snapshot,
+                    self.pending_entry_side,
+                    hsi_price,
+                )
+                if chase_price is None:
+                    conservative_extreme_buy1 = True
+                    chase_reason = f"{chase_reason}，保守继续挂最新 buy1"
+                else:
+                    new_price = chase_price
             price_decimals = _price_decimals(snapshot["price_spread"])
             current_order_price = float(order.get("price", 0.0))
             price_unchanged = (
                 current_order_price > 0
                 and round(new_price, price_decimals) == round(current_order_price, price_decimals)
             )
+            if conservative_extreme_buy1 and price_unchanged:
+                self.entry_chase_count = 1
+                self.entry_order_time = datetime.now()
+                self.warrant_tick_size = snapshot["price_spread"]
+                self._save_runtime_state()
+                await self._emit_trade_record(TradeRecord(
+                    time=current_time,
+                    signal=TradeSignal.ENTRY_CHASING,
+                    price=hsi_price,
+                    rsi=round(rsi, 2),
+                    position=PositionType.NONE,
+                    message=(
+                        f"极度买入未成交，未追一格，继续挂 buy1: {self.current_warrant_code} "
+                        f"@ {new_price:.3f} | {self._format_entry_book(snapshot)} "
+                        f"| 原因:{chase_reason}"
+                    ),
+                ))
+                return
             if self.entry_mode == MOMENTUM_ENTRY_MODE and price_unchanged:
                 if elapsed < self.entry_order_wait_seconds * 2:
                     return
@@ -1415,13 +1533,25 @@ class HSIStrategyEngine:
                 self.entry_order_time = datetime.now()
                 self.warrant_tick_size = snapshot["price_spread"]
                 self._save_runtime_state()
+                if conservative_extreme_buy1:
+                    message = (
+                        f"极度买入未成交，未追一格，已改挂最新 buy1: {self.current_warrant_code} "
+                        f"{current_order_price:.3f}->{new_price:.3f} "
+                        f"| {self._format_entry_book(snapshot)} | 原因:{chase_reason}"
+                    )
+                else:
+                    message = (
+                        f"买入未成交，已追价一次: {self.current_warrant_code} "
+                        f"{current_order_price:.3f}->{new_price:.3f} "
+                        f"| {self._format_entry_book(snapshot)} | 原因:{chase_reason}"
+                    )
                 await self._emit_trade_record(TradeRecord(
                     time=current_time,
                     signal=TradeSignal.ENTRY_CHASING,
                     price=hsi_price,
                     rsi=round(rsi, 2),
                     position=PositionType.NONE,
-                    message=f"买入未成交，已追价一次到最新 buy1: {self.current_warrant_code} @ {new_price:.3f}",
+                    message=message,
                 ))
             return
 

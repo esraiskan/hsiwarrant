@@ -44,6 +44,24 @@ def _safe_float(value) -> float | None:
         return None
 
 
+def _first_safe_float(row, keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = _safe_float(row.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _first_book_level_volume(book: dict, side: str) -> float | None:
+    levels = book.get(side)
+    if not levels:
+        return None
+    first_level = levels[0]
+    if not isinstance(first_level, (list, tuple)) or len(first_level) < 2:
+        return None
+    return _safe_float(first_level[1])
+
+
 # ============== 推送处理器 ==============
 
 class _QuotePushHandler(StockQuoteHandlerBase):
@@ -232,7 +250,7 @@ class FutuDataSource:
     def get_snapshot(self) -> dict | None:
         return self.get_realtime_price()
 
-    def get_security_snapshot(self, code: str) -> dict | None:
+    def get_security_snapshot(self, code: str, include_order_book: bool = False) -> dict | None:
         """获取指定牛熊证/证券快照，含买一、卖一和最小价差。"""
         if not self.is_connected:
             if not self.connect():
@@ -247,6 +265,13 @@ class FutuDataSource:
             bid_price = _safe_float(row.get("bid_price"))
             ask_price = _safe_float(row.get("ask_price"))
             price_spread = _safe_float(row.get("price_spread"))
+            bid_volume = _first_safe_float(row, ("bid_volume", "bid_vol", "bid_qty", "bid_size"))
+            ask_volume = _first_safe_float(row, ("ask_volume", "ask_vol", "ask_qty", "ask_size"))
+            if include_order_book and (bid_volume is None or ask_volume is None):
+                ret_book, book = self.quote_ctx.get_order_book(code, num=1)
+                if ret_book == RET_OK and isinstance(book, dict):
+                    bid_volume = bid_volume or _first_book_level_volume(book, "Bid")
+                    ask_volume = ask_volume or _first_book_level_volume(book, "Ask")
             last_price = _safe_float(row.get("last_price"))
             lot_size = _safe_float(row.get("lot_size"))
             if bid_price is None or ask_price is None or price_spread is None:
@@ -262,6 +287,8 @@ class FutuDataSource:
                 "bid_price": bid_price,
                 "ask_price": ask_price,
                 "price_spread": price_spread,
+                "bid_volume": bid_volume or 0.0,
+                "ask_volume": ask_volume or 0.0,
                 "lot_size": int(lot_size) if lot_size is not None else 0,
                 "last_price": last_price or 0.0,
                 "update_time": str(row.get("update_time", "")),
