@@ -1,7 +1,7 @@
 import type {
   StrategyConfig, StrategyState, TradeRecord, KlineData,
   OpenDStatus, AccountInfo, MarketSnapshot, TradeEnvUpdateRequest, TradeEnvUpdateResponse,
-  TodayPnl,
+  TodayPnl, BacktestRequest, BacktestResult, MarketRegime,
 } from './types';
 
 const BASE_URL = '/api';
@@ -12,7 +12,16 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
     ...options,
   });
   if (!res.ok) {
-    throw new Error(`API Error: ${res.status} ${res.statusText}`);
+    let message = `API Error: ${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (typeof body?.detail === 'string') {
+        message = body.detail;
+      }
+    } catch {
+      // Keep the HTTP status fallback when the response is not JSON.
+    }
+    throw new Error(message);
   }
   return res.json();
 }
@@ -45,6 +54,9 @@ export const getTrades = () => request<TradeRecord[]>('/trades');
 /** 获取 K 线历史 */
 export const getKlines = () => request<KlineData[]>('/klines');
 
+/** 获取盘中市况 */
+export const getMarketRegime = () => request<MarketRegime | null>('/market-regime');
+
 /** 获取 OpenD 连接状态 */
 export const getOpenDStatus = () => request<OpenDStatus>('/opend/status');
 
@@ -69,3 +81,10 @@ export const getPositions = () => request<Record<string, unknown>[]>('/opend/pos
 
 /** 获取今日订单 */
 export const getOrders = () => request<Record<string, unknown>[]>('/opend/orders');
+
+/** 执行策略回测 */
+export const runBacktest = (payload: BacktestRequest) =>
+  request<BacktestResult>('/backtest', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });

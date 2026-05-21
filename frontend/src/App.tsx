@@ -1,18 +1,20 @@
 import { useCallback, useState } from 'react';
-import { Row, Col, message, ConfigProvider, theme } from 'antd';
+import { Row, Col, message, ConfigProvider, theme, Tabs } from 'antd';
 import zhCN from 'antd/locale/zh_CN';
 import StatusPanel from './components/StatusPanel';
 import PriceChart from './components/PriceChart';
 import TradeLog from './components/TradeLog';
 import ControlPanel from './components/ControlPanel';
 import OpenDPanel from './components/OpenDPanel';
+import BacktestPanel from './components/BacktestPanel';
+import MarketRegimeBanner from './components/MarketRegimeBanner';
 import { useWebSocket } from './useWebSocket';
 import { colors } from './theme';
 import * as api from './api';
 import type { StrategyConfig } from './types';
 
 export default function App() {
-  const { connected, state, klines, trades, todayPnl, clearData, refreshData, refreshTodayPnl } = useWebSocket();
+  const { connected, state, klines, trades, marketRegime, todayPnl, clearData, refreshData, refreshTodayPnl } = useWebSocket();
   const [actionLoading, setActionLoading] = useState<'start' | 'stop' | 'reset' | null>(null);
   const [rsiLength, setRsiLength] = useState(14);
 
@@ -102,26 +104,45 @@ export default function App() {
 
         {/* Content */}
         <div style={{ padding: '16px 20px', maxWidth: 1440, margin: '0 auto' }}>
-          <OpenDPanel onTradeEnvChanged={refreshTodayPnl} />
-          <StatusPanel state={state} connected={connected} todayPnl={todayPnl} />
+          <Tabs
+            defaultActiveKey="live"
+            items={[
+              {
+                key: 'live',
+                label: '實盤監控',
+                children: (
+                  <>
+                    <MarketRegimeBanner marketRegime={marketRegime} />
+                    <OpenDPanel onTradeEnvChanged={refreshTodayPnl} />
+                    <StatusPanel state={state} connected={connected} todayPnl={todayPnl} />
 
-          <Row gutter={16}>
-            <Col xs={24} lg={17}>
-              <PriceChart klines={klines} trades={trades} entryPrice={state?.entry_price ?? 0} rsiLength={rsiLength} />
-            </Col>
-            <Col xs={24} lg={7}>
-              <ControlPanel
-                isRunning={state?.is_running ?? false}
-                actionLoading={actionLoading}
-                onConfigLoaded={handleConfigLoaded}
-                onStart={handleStart}
-                onStop={handleStop}
-                onReset={handleReset}
-              />
-            </Col>
-          </Row>
+                    <Row gutter={16}>
+                      <Col xs={24} lg={17}>
+                        <PriceChart klines={klines} trades={trades} entryPrice={state?.entry_price ?? 0} rsiLength={rsiLength} />
+                      </Col>
+                      <Col xs={24} lg={7}>
+                        <ControlPanel
+                          isRunning={state?.is_running ?? false}
+                          actionLoading={actionLoading}
+                          onConfigLoaded={handleConfigLoaded}
+                          onStart={handleStart}
+                          onStop={handleStop}
+                          onReset={handleReset}
+                        />
+                      </Col>
+                    </Row>
 
-          <TradeLog trades={trades} />
+                    <TradeLog trades={trades} />
+                  </>
+                ),
+              },
+              {
+                key: 'backtest',
+                label: '策略回測',
+                children: <BacktestPanel />,
+              },
+            ]}
+          />
         </div>
       </div>
     </ConfigProvider>

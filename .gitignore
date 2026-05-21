@@ -23,10 +23,12 @@ coverage/
 # Environment and secrets
 .env
 .env.*
+.codex/
 
 # Logs and runtime output
 *.log
 backend/*_log.csv
+backend/*.csv.bak_*
 backend/*_state.json
 backend/bt_result.txt
 

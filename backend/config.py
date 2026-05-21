@@ -19,7 +19,10 @@ RSI_OVERBOUGHT = 82  # RSI 超买阈值 (更严格)
 VOL_MA_PERIOD = 20  # 成交量均线周期
 POLL_INTERVAL = 3  # 图表+策略研判间隔 (秒)
 ENTRY_ORDER_WAIT_SECONDS = 40  # 买入挂单每次等待时间 (秒)
-ENTRY_CUTOFF_TIME = "15:50"  # 此时间后不再开新买入单
+ENTRY_CUTOFF_TIME = "15:45"  # 此时间后不再开新买入单
+EXTREME_RSI_STOP_VETO_ENABLED = True  # 极端 RSI 时取消当次普通止损
+EXTREME_RSI_STOP_HARD_TICKS = 2  # 取消普通止损后，硬止损设为触发价 - N 格
+EXTREME_RSI_STOP_REARM_TICKS = 1  # 价格回到触发价 + N 格后，普通止损重新武装
 
 # 放量动能追价过滤
 MOMENTUM_BEAR_MIN_RSI = 28

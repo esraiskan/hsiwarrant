@@ -49,7 +49,7 @@ def load_trade_log(path: Path = TRADE_LOG_PATH) -> list[TradeRecord]:
 
     records: list[TradeRecord] = []
     try:
-        with path.open("r", newline="", encoding="utf-8") as f:
+        with path.open("r", newline="", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for line_no, row in enumerate(reader, start=2):
                 try:

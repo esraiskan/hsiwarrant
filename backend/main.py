@@ -7,7 +7,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import (
@@ -15,7 +15,15 @@ from config import (
     RSI_OVERSOLD, RSI_OVERBOUGHT, VOL_MA_PERIOD, POLL_INTERVAL,
     FUTU_HOST, FUTU_PORT,
 )
-from models import ConfigResponse, ConfigUpdate, TradeEnvUpdate, TradeEnvUpdateResponse
+from backtest_service import run_backtest
+from models import (
+    BacktestRequest,
+    BacktestResult,
+    ConfigResponse,
+    ConfigUpdate,
+    TradeEnvUpdate,
+    TradeEnvUpdateResponse,
+)
 from strategy import HSIStrategyEngine
 from trade_log_store import load_today_trade_log
 
@@ -69,10 +77,15 @@ async def on_state_update(state):
     await manager.broadcast({"type": "state", "data": state.model_dump()})
 
 
+async def on_market_regime_update(regime):
+    await manager.broadcast({"type": "market_regime", "data": regime.model_dump()})
+
+
 engine.on_kline_update = on_kline_update
 engine.on_kline_batch = on_kline_batch
 engine.on_trade_signal = on_trade_signal
 engine.on_state_update = on_state_update
+engine.on_market_regime_update = on_market_regime_update
 
 
 # ============== FastAPI 应用 ==============
@@ -138,6 +151,11 @@ async def get_config():
         entry_order_wait_seconds=engine.entry_order_wait_seconds,
         entry_cutoff_time=engine.entry_cutoff_time,
         only_extreme_entries=engine.only_extreme_entries,
+        enabled_strategies=engine.enabled_strategies,
+        enabled_extreme_branches=engine.enabled_extreme_branches,
+        extreme_rsi_stop_veto_enabled=engine.extreme_rsi_stop_veto_enabled,
+        extreme_rsi_stop_hard_ticks=engine.extreme_rsi_stop_hard_ticks,
+        extreme_rsi_stop_rearm_ticks=engine.extreme_rsi_stop_rearm_ticks,
     )
 
 
@@ -186,6 +204,7 @@ async def reset_strategy():
     engine.on_kline_batch = on_kline_batch
     engine.on_trade_signal = on_trade_signal
     engine.on_state_update = on_state_update
+    engine.on_market_regime_update = on_market_regime_update
     return {"message": "策略已重置"}
 
 
@@ -199,6 +218,24 @@ async def get_trades():
 @app.get("/api/klines")
 async def get_klines():
     return [k.model_dump() for k in engine.kline_history_1m]
+
+
+@app.get("/api/market-regime")
+async def get_market_regime():
+    if engine.market_regime is None:
+        return None
+    return engine.market_regime.model_dump()
+
+
+@app.post("/api/backtest", response_model=BacktestResult)
+async def run_backtest_api(payload: BacktestRequest):
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, run_backtest, payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=f"回测失败: {e}")
 
 
 # ============== OpenD 相关 API ==============
@@ -317,6 +354,11 @@ async def websocket_endpoint(websocket: WebSocket):
             "type": "state",
             "data": state.model_dump(),
         }, ensure_ascii=False, default=str))
+        if engine.market_regime is not None:
+            await websocket.send_text(json.dumps({
+                "type": "market_regime",
+                "data": engine.market_regime.model_dump(),
+            }, ensure_ascii=False, default=str))
 
         while True:
             data = await websocket.receive_text()

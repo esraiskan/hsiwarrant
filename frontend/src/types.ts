@@ -30,6 +30,29 @@ export interface KlineData {
   vol_ma: number | null;
 }
 
+/** 盤中市況分類，只作顯示和參數建議，不參與交易邏輯 */
+export interface MarketRegime {
+  regime: string;
+  label: string;
+  bias: 'bullish' | 'bearish' | 'neutral' | 'repair';
+  confidence: number;
+  suggested_rsi_overbought_low: number;
+  suggested_rsi_overbought_high: number;
+  suggested_rsi_oversold_low: number;
+  suggested_rsi_oversold_high: number;
+  advice: string;
+  reasons: string[];
+  updated_at: string;
+  update_interval_seconds: number;
+  current_price: number | null;
+  day_open: number | null;
+  previous_close: number | null;
+  opening_range_high: number | null;
+  opening_range_low: number | null;
+  opening_range_mid: number | null;
+  day_position_pct: number | null;
+}
+
 /** 交易记录 */
 export interface TradeRecord {
   time: string;
@@ -83,6 +106,11 @@ export interface StrategyConfig {
   entry_order_wait_seconds: number;
   entry_cutoff_time: string;
   only_extreme_entries: boolean;
+  enabled_strategies: BacktestStrategy[];
+  enabled_extreme_branches: BacktestExtremeBranch[];
+  extreme_rsi_stop_veto_enabled: boolean;
+  extreme_rsi_stop_hard_ticks: number;
+  extreme_rsi_stop_rearm_ticks: number;
 }
 
 /** OpenD 连接状态 */
@@ -155,10 +183,82 @@ export interface MarketSnapshot {
   turnover: number;
 }
 
+export type BacktestPeriodMode = 'months' | 'date_range';
+export type BacktestStrategy = 'normal' | 'extreme' | 'momentum' | 'cum_trend' | 'rsi_divergence';
+export type BacktestExtremeBranch =
+  | 'b1_volume_extreme'
+  | 'b2_very_extreme_pullback'
+  | 'b3_completed_k'
+  | 'b4_shadow_reversal';
+export type BacktestCumTrendMode = 'strict_breadth' | 'market_log_breadth' | 'kline_proxy';
+
+export interface BacktestRequest {
+  period_mode: BacktestPeriodMode;
+  months: string[];
+  date_start?: string;
+  date_end?: string;
+  rsi_length: number;
+  rsi_oversold: number;
+  rsi_overbought: number;
+  take_profit_points: number;
+  stop_loss_points: number;
+  fixed_win_hkd: number;
+  fixed_loss_hkd: number;
+  selection: {
+    strategies: BacktestStrategy[];
+    extreme_branches: BacktestExtremeBranch[];
+  };
+  cum_trend_mode: BacktestCumTrendMode;
+}
+
+export interface BacktestSummary {
+  trades: number;
+  wins: number;
+  losses: number;
+  win_rate: number;
+  pnl_hkd: number;
+}
+
+export interface BacktestBreakdownRow extends BacktestSummary {
+  key: string;
+  label: string;
+}
+
+export interface BacktestTrade {
+  trade_date: string;
+  side: 'bull' | 'bear';
+  mode: string;
+  branch: string;
+  entry_time: string;
+  exit_time: string;
+  entry: number;
+  exit: number;
+  points: number;
+  result: 'W' | 'L';
+  pnl_hkd: number;
+  minutes: number;
+  desc: string;
+}
+
+export interface BacktestResult {
+  requested_start: string;
+  requested_end: string;
+  data_start: string;
+  data_end: string;
+  summary: BacktestSummary;
+  monthly: BacktestBreakdownRow[];
+  daily: BacktestBreakdownRow[];
+  strategy_breakdown: BacktestBreakdownRow[];
+  extreme_branch_breakdown: BacktestBreakdownRow[];
+  trades: BacktestTrade[];
+  warnings: string[];
+}
+
 /** WebSocket 消息 */
 export type WSMessage =
   | { type: 'kline'; data: KlineData }
   | { type: 'kline_batch'; data: KlineData[] }
+  | { type: 'market_regime'; data: MarketRegime }
   | { type: 'trade'; data: TradeRecord }
   | { type: 'state'; data: StrategyState }
   | { type: 'pong' };

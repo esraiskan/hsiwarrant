@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Button, Input, InputNumber, Form, Select, Switch, message } from 'antd';
+import { Button, Checkbox, Input, InputNumber, Form, Select, Switch, message } from 'antd';
 import {
   PlayCircleOutlined,
   PauseCircleOutlined,
@@ -29,10 +29,27 @@ function SectionTitle({ children }: { children: React.ReactNode }) {
   );
 }
 
+const strategyOptions = [
+  { label: '普通超買/超賣', value: 'normal' },
+  { label: '極度策略', value: 'extreme' },
+  { label: '放量動能', value: 'momentum' },
+  { label: '累積趨勢', value: 'cum_trend' },
+  { label: 'RSI背離', value: 'rsi_divergence' },
+];
+
+const extremeBranchOptions = [
+  { label: 'B1 極度RSI+放量', value: 'b1_volume_extreme' },
+  { label: 'B2 非常極端回抽', value: 'b2_very_extreme_pullback' },
+  { label: 'B3 完成K補單', value: 'b3_completed_k' },
+  { label: 'B4 上下影反轉', value: 'b4_shadow_reversal' },
+];
+
 export default function ControlPanel({ isRunning, actionLoading, onConfigLoaded, onStart, onStop, onReset }: Props) {
   const [config, setConfig] = useState<StrategyConfig | null>(null);
   const [loading, setLoading] = useState(false);
   const [form] = Form.useForm();
+  const enabledStrategies = Form.useWatch('enabled_strategies', form) || [];
+  const hasExtreme = enabledStrategies.includes('extreme');
 
   useEffect(() => {
     api.getConfig().then((loaded) => {
@@ -48,6 +65,14 @@ export default function ControlPanel({ isRunning, actionLoading, onConfigLoaded,
   const handleSave = async () => {
     try {
       const values = await form.validateFields();
+      if (!values.enabled_strategies?.length) {
+        message.error('請至少選擇一個實盤策略');
+        return;
+      }
+      if (values.enabled_strategies.includes('extreme') && !values.enabled_extreme_branches?.length) {
+        message.error('啟用極度策略時，請至少選擇一個極度分支');
+        return;
+      }
       setLoading(true);
       await api.updateConfig(values);
       const updated = await api.getConfig();
@@ -131,7 +156,8 @@ export default function ControlPanel({ isRunning, actionLoading, onConfigLoaded,
               ['开仓数量', `${config.share_count.toLocaleString()} 份`],
               ['RSI 周期', `${config.rsi_length}`],
               ['掛單等待', `${config.entry_order_wait_seconds} 秒`],
-              ['入場限制', config.only_extreme_entries ? '只買極度' : '全部模式'],
+              ['實盤策略', config.enabled_strategies?.length ? `${config.enabled_strategies.length} 個啟用` : '未設定'],
+              ['RSI止損取消', config.extreme_rsi_stop_veto_enabled ? `開 / 硬-${config.extreme_rsi_stop_hard_ticks}格` : '關'],
               ['牛证', config.bull_warrant_code ? `${config.bull_warrant_code} ${config.bull_warrant_name || ''}` : '未设置'],
               ['熊证', config.bear_warrant_code ? `${config.bear_warrant_code} ${config.bear_warrant_name || ''}` : '未设置'],
             ].map(([label, value]) => (
@@ -201,12 +227,32 @@ export default function ControlPanel({ isRunning, actionLoading, onConfigLoaded,
             <InputNumber min={5} max={300} style={{ width: '100%' }} />
           </Form.Item>
           <Form.Item
-            label="只買極度超買/超賣"
-            name="only_extreme_entries"
+            label="可交易策略"
+            name="enabled_strategies"
+            style={{ marginBottom: 10, gridColumn: '1 / -1' }}
+          >
+            <Checkbox.Group options={strategyOptions} />
+          </Form.Item>
+          <Form.Item
+            label="極度分支"
+            name="enabled_extreme_branches"
+            style={{ marginBottom: 10, gridColumn: '1 / -1' }}
+          >
+            <Checkbox.Group disabled={!hasExtreme} options={extremeBranchOptions} />
+          </Form.Item>
+          <Form.Item
+            label="極端RSI取消止損"
+            name="extreme_rsi_stop_veto_enabled"
             valuePropName="checked"
             style={{ marginBottom: 10 }}
           >
             <Switch />
+          </Form.Item>
+          <Form.Item label="取消後硬止損 (格)" name="extreme_rsi_stop_hard_ticks" style={{ marginBottom: 10 }}>
+            <InputNumber min={1} max={10} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item label="重新武裝 (格)" name="extreme_rsi_stop_rearm_ticks" style={{ marginBottom: 10 }}>
+            <InputNumber min={1} max={10} style={{ width: '100%' }} />
           </Form.Item>
         </div>
         <Button

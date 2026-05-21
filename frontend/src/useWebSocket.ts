@@ -1,5 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
-import type { WSMessage, KlineData, TradeRecord, StrategyState, TodayPnl } from './types';
+import type { MutableRefObject } from 'react';
+import type { WSMessage, KlineData, TradeRecord, StrategyState, TodayPnl, MarketRegime } from './types';
 import * as api from './api';
 
 const WS_PROTOCOL = window.location.protocol === 'https:' ? 'wss' : 'ws';
@@ -12,13 +13,37 @@ interface PersistedData {
   state: StrategyState | null;
   klines: KlineData[];
   trades: TradeRecord[];
+  marketRegime: MarketRegime | null;
 }
 
 const emptyPersistedData: PersistedData = {
   state: null,
   klines: [],
   trades: [],
+  marketRegime: null,
 };
+
+const HIGH_CONFIDENCE_REGIMES = new Set([
+  'weak_continuation',
+  'breakdown_failure_repair',
+  'strong_trend',
+]);
+
+function nextStableMarketRegime(
+  current: MarketRegime | null,
+  pendingRef: MutableRefObject<{ regime: string; count: number } | null>,
+  incoming: MarketRegime,
+) {
+  if (!current || incoming.regime === current.regime || HIGH_CONFIDENCE_REGIMES.has(incoming.regime)) {
+    pendingRef.current = null;
+    return incoming;
+  }
+
+  const pending = pendingRef.current;
+  const count = pending?.regime === incoming.regime ? pending.count + 1 : 1;
+  pendingRef.current = { regime: incoming.regime, count };
+  return count >= 2 ? incoming : current;
+}
 
 function todayKey() {
   const formatter = new Intl.DateTimeFormat('en-CA', {
@@ -48,6 +73,7 @@ function readPersistedData(): PersistedData {
       state: parsed.state ?? null,
       klines: Array.isArray(parsed.klines) ? parsed.klines : [],
       trades: Array.isArray(parsed.trades) ? filterTodayTrades(parsed.trades) : [],
+      marketRegime: parsed.marketRegime ?? null,
     };
   } catch {
     return emptyPersistedData;
@@ -77,7 +103,9 @@ export function useWebSocket() {
   const [state, setState] = useState<StrategyState | null>(initialDataRef.current.state);
   const [klines, setKlines] = useState<KlineData[]>(initialDataRef.current.klines);
   const [trades, setTrades] = useState<TradeRecord[]>(initialDataRef.current.trades);
+  const [marketRegime, setMarketRegime] = useState<MarketRegime | null>(initialDataRef.current.marketRegime);
   const [todayPnl, setTodayPnl] = useState<TodayPnl | null>(null);
+  const pendingRegimeRef = useRef<{ regime: string; count: number } | null>(null);
 
   const refreshTodayPnl = useCallback(async () => {
     try {
@@ -88,11 +116,12 @@ export function useWebSocket() {
   }, []);
 
   const refreshData = useCallback(async () => {
-    const [stateResult, tradesResult, klinesResult, todayPnlResult] = await Promise.allSettled([
+    const [stateResult, tradesResult, klinesResult, todayPnlResult, marketRegimeResult] = await Promise.allSettled([
       api.getState(),
       api.getTrades(),
       api.getKlines(),
       api.getTodayPnl(),
+      api.getMarketRegime(),
     ]);
 
     if (stateResult.status === 'fulfilled') {
@@ -106,6 +135,9 @@ export function useWebSocket() {
     }
     if (todayPnlResult.status === 'fulfilled') {
       setTodayPnl(todayPnlResult.value);
+    }
+    if (marketRegimeResult.status === 'fulfilled') {
+      setMarketRegime(marketRegimeResult.value);
     }
   }, []);
 
@@ -147,6 +179,9 @@ export function useWebSocket() {
             break;
           case 'kline_batch':
             setKlines(msg.data);
+            break;
+          case 'market_regime':
+            setMarketRegime((prev) => nextStableMarketRegime(prev, pendingRegimeRef, msg.data));
             break;
           case 'trade':
             if (isTodayTrade(msg.data)) {
@@ -201,13 +236,15 @@ export function useWebSocket() {
   }, [refreshTodayPnl]);
 
   useEffect(() => {
-    writePersistedData({ state, klines, trades: filterTodayTrades(trades) });
-  }, [state, klines, trades]);
+    writePersistedData({ state, klines, trades: filterTodayTrades(trades), marketRegime });
+  }, [state, klines, trades, marketRegime]);
 
   const clearData = useCallback(() => {
     setKlines([]);
     setTrades([]);
     setState(null);
+    setMarketRegime(null);
+    pendingRegimeRef.current = null;
     try {
       window.localStorage.removeItem(STORAGE_KEY);
     } catch {
@@ -215,5 +252,5 @@ export function useWebSocket() {
     }
   }, []);
 
-  return { connected, state, klines, trades, todayPnl, clearData, refreshData, refreshTodayPnl };
+  return { connected, state, klines, trades, marketRegime, todayPnl, clearData, refreshData, refreshTodayPnl };
 }

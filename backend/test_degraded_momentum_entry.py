@@ -6,6 +6,7 @@ from models import PositionType
 from strategy import (
     MOMENTUM_ENTRY_MODE,
     MOMENTUM_PENDING_ADVERSE_MOVE_POINTS,
+    MOMENTUM_PENDING_VWAP_SLOPE_BUFFER,
     HSIStrategyEngine,
 )
 
@@ -64,7 +65,7 @@ class DegradedMomentumEntryTest(unittest.TestCase):
         self.assertEqual(self.engine.pending_buy_order_id, "")
         self.assertIn("反弹5.0点", self.records[0].message)
 
-    def test_momentum_pending_cancels_when_vwap_slope_reverses(self):
+    def test_bull_momentum_pending_keeps_order_when_vwap_slope_is_flat(self):
         self._set_pending_momentum(PositionType.BULL, trigger_price=26410.0)
 
         cancelled = asyncio.run(self.engine._cancel_degraded_momentum_entry(
@@ -74,9 +75,53 @@ class DegradedMomentumEntryTest(unittest.TestCase):
             curr_slope=0.0,
         ))
 
+        self.assertFalse(cancelled)
+        self.engine.trader.cancel_order.assert_not_called()
+        self.assertEqual(self.engine.pending_buy_order_id, "ORDER-1")
+        self.assertEqual(self.records, [])
+
+    def test_bull_momentum_pending_cancels_when_vwap_slope_reverses_past_buffer(self):
+        self._set_pending_momentum(PositionType.BULL, trigger_price=26410.0)
+
+        cancelled = asyncio.run(self.engine._cancel_degraded_momentum_entry(
+            "2026-05-11 15:26:30",
+            hsi_price=26409.0,
+            rsi=65.0,
+            curr_slope=-(MOMENTUM_PENDING_VWAP_SLOPE_BUFFER + 0.01),
+        ))
+
         self.assertTrue(cancelled)
         self.engine.trader.cancel_order.assert_called_once_with("ORDER-1")
-        self.assertIn("VWAP斜率不再向上", self.records[0].message)
+        self.assertIn("VWAP斜率反向<=-0.05", self.records[0].message)
+
+    def test_bear_momentum_pending_keeps_order_when_vwap_slope_is_flat(self):
+        self._set_pending_momentum(PositionType.BEAR, trigger_price=26410.0)
+
+        cancelled = asyncio.run(self.engine._cancel_degraded_momentum_entry(
+            "2026-05-11 15:26:30",
+            hsi_price=26409.0,
+            rsi=40.0,
+            curr_slope=0.0,
+        ))
+
+        self.assertFalse(cancelled)
+        self.engine.trader.cancel_order.assert_not_called()
+        self.assertEqual(self.engine.pending_buy_order_id, "ORDER-1")
+        self.assertEqual(self.records, [])
+
+    def test_bear_momentum_pending_cancels_when_vwap_slope_reverses_past_buffer(self):
+        self._set_pending_momentum(PositionType.BEAR, trigger_price=26410.0)
+
+        cancelled = asyncio.run(self.engine._cancel_degraded_momentum_entry(
+            "2026-05-11 15:26:30",
+            hsi_price=26409.0,
+            rsi=40.0,
+            curr_slope=MOMENTUM_PENDING_VWAP_SLOPE_BUFFER + 0.01,
+        ))
+
+        self.assertTrue(cancelled)
+        self.engine.trader.cancel_order.assert_called_once_with("ORDER-1")
+        self.assertIn("VWAP斜率反向>=0.05", self.records[0].message)
 
     def test_momentum_pending_keeps_order_when_signal_still_valid(self):
         self._set_pending_momentum(PositionType.BULL, trigger_price=26410.0)
