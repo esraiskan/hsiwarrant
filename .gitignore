@@ -31,6 +31,9 @@ backend/*_log.csv
 backend/*.csv.bak_*
 backend/*_state.json
 backend/bt_result.txt
+backend/data/cbbc/*.parquet
+/_*.ps1
+/proxy_probe.json
 
 # OS / editor
 .DS_Store

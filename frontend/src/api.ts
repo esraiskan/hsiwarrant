@@ -2,6 +2,7 @@ import type {
   StrategyConfig, StrategyState, TradeRecord, KlineData,
   OpenDStatus, AccountInfo, MarketSnapshot, TradeEnvUpdateRequest, TradeEnvUpdateResponse,
   TodayPnl, BacktestRequest, BacktestResult, MarketRegime,
+  CbbcAiAdviceResponse, HksiStyleAiAdviceResponse,
 } from './types';
 
 const BASE_URL = '/api';
@@ -88,3 +89,11 @@ export const runBacktest = (payload: BacktestRequest) =>
     method: 'POST',
     body: JSON.stringify(payload),
   });
+
+/** 触发一次 CBBC AI 决策建议请求 (read-only, 不影响交易) */
+export const requestCbbcAiAdvice = () =>
+  request<CbbcAiAdviceResponse>('/cbbc/ai-advice', { method: 'POST' });
+
+/** 觸發一次 HKSI-style AI 分析 (read-only, 不影響交易) */
+export const requestHksiStyleAiAdvice = () =>
+  request<HksiStyleAiAdviceResponse>('/cbbc/hksi-style-ai-advice', { method: 'POST' });

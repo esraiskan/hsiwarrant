@@ -115,6 +115,11 @@ class _Runtime:
     breadth_missing_count: int = 0
     breadth_used_count: int = 0
     breadth_proxy_count: int = 0
+    # CBBC magnet signal layer (cbbc-magnet-signal task 10.2). Optional so
+    # back-tests still run on machines that lack the CBBC data feed.
+    cbbc_adapter: "object | None" = None
+    cbbc_layer_active: bool = False
+    cbbc_skip_today: bool = False
 
 
 @dataclass
@@ -825,6 +830,11 @@ def _run_day(
     last_extreme_stop_time: pd.Timestamp | None = None
     divergence_state = _RsiDivergenceState.create()
     start_idx = max(VOL_MA_PERIOD, payload.rsi_length) + 1
+    # CBBC magnet adapter (task 10.2): branches that are eligible for magnet
+    # consultation. Mirrors task 7.3 — only the four extreme branches consult.
+    _MAGNET_BRANCHES = ("b1_volume_extreme", "b2_very_extreme_pullback",
+                         "b3_completed_k", "b4_shadow_reversal")
+    cbbc_adapter = runtime.cbbc_adapter if not runtime.cbbc_skip_today else None
     for i in range(start_idx, len(d1_day)):
         row = d1_day.iloc[i]
         ts = d1_day.index[i]
@@ -832,6 +842,15 @@ def _run_day(
         rsi = float(row["RSI"])
         if _is_nan(rsi) or _is_nan(row["VOL_MA"]):
             continue
+
+        # Feed the latest HSI spot into the magnet engine for every bar so
+        # ``consult_extreme`` has a fresh result to draw on (task 10.2).
+        if cbbc_adapter is not None:
+            try:
+                cbbc_adapter.at_replay_ts(ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts, price)
+            except Exception:  # noqa: BLE001 - magnet feed must never break the back-test
+                pass
+
         if position != PositionType.NONE:
             diff = price - entry if position == PositionType.BULL else entry - price
             exit_reason = ""
@@ -890,6 +909,26 @@ def _run_day(
         side, mode, branch, desc = detected
         if branch in ("b3_completed_k", "b4_shadow_reversal"):
             last_completed_extreme_kline_time = d1_day.index[i - 1].strftime("%Y-%m-%d %H:%M:%S")
+
+        # CBBC magnet veto (task 10.2). Mirrors strategy.py: only extreme
+        # branches consult; non-extreme branches pass straight through.
+        if cbbc_adapter is not None and branch in _MAGNET_BRANCHES:
+            try:
+                _decision = cbbc_adapter.consult_extreme(
+                    side.value,
+                    price,
+                    ts.to_pydatetime() if hasattr(ts, "to_pydatetime") else ts,
+                    branch=branch,
+                    mode=mode,
+                )
+                if _decision is not None and getattr(_decision, "vetoed_by_cbbc_magnet", False):
+                    # Vetoed: skip this entry entirely. Mirrors
+                    # _emit_strategy_disabled_skip's behaviour in strategy.py
+                    # (no entry submitted, loop continues).
+                    continue
+            except Exception:  # noqa: BLE001 - fail-safe per R10.6
+                pass
+
         if last_tp_side == side and last_tp_time is not None:
             if (ts - last_tp_time).total_seconds() < SAME_SIDE_TAKE_PROFIT_COOLDOWN_SECONDS:
                 continue
@@ -975,15 +1014,73 @@ def run_backtest(payload: BacktestRequest) -> BacktestResult:
 
     all_trades: list[_Trade] = []
     dates = sorted(d for d in set(d1.index.date) if start <= d <= end)
+    # CBBC magnet adapter setup (task 10.2). Best-effort: if any of the CBBC
+    # modules are unavailable in the environment (e.g. pyarrow missing), we
+    # log a warning and run the back-test without magnet vetoes so the rest
+    # of the pipeline still works.
+    try:
+        from cbbc_backtest_adapter import CbbcBacktestAdapter  # local import
+        from runtime_config_store import CBBC_FIELD_DEFAULTS, load_runtime_config
+
+        cbbc_config_data = load_runtime_config()
+        # Build a duck-typed RuntimeConfigView from the loaded config (or
+        # defaults) so the adapter can read the three knobs it needs.
+        cbbc_view = type("_BacktestCbbcConfig", (object,), {})()
+        for _key, _default in CBBC_FIELD_DEFAULTS.items():
+            setattr(cbbc_view, _key, cbbc_config_data.get(_key, _default))
+        runtime.cbbc_adapter = CbbcBacktestAdapter(
+            config=cbbc_view,
+            decay_points=float(cbbc_view.cbbc_magnet_decay_points),
+        )
+        runtime.cbbc_layer_active = bool(cbbc_view.cbbc_magnet_layer_enabled)
+    except Exception as _cbbc_setup_exc:  # noqa: BLE001
+        runtime.warnings.add(
+            f"cbbc_adapter_disabled:{type(_cbbc_setup_exc).__name__}"
+        )
+        runtime.cbbc_adapter = None
+
     for day in dates:
         d1_day = d1[d1.index.date == day]
         d15_day = d15[d15.index.date == day]
         if len(d1_day) < 30 or d15_day.empty:
             continue
+
+        # Per-day magnet preparation (task 10.2). Missing-snapshot days
+        # silently skip vetoes so the back-test still produces trade data
+        # for that session, but ``cbbc_snapshot_missing_days`` increments.
+        runtime.cbbc_skip_today = False
+        if runtime.cbbc_adapter is not None:
+            try:
+                prep = runtime.cbbc_adapter.prepare_for_day(day)
+                runtime.cbbc_skip_today = bool(prep.missing)
+            except Exception:  # noqa: BLE001 - never let CBBC abort the day
+                runtime.cbbc_skip_today = True
+
         all_trades.extend(_run_day(d1_day, d15_day, day, payload, runtime, breadth))
     warnings.update(runtime.warnings)
     if runtime.breadth_missing_count:
         warnings.add(f"breadth_missing_count:{runtime.breadth_missing_count}")
+    # Surface CBBC magnet summary into ``warnings`` so callers can observe
+    # veto activity without changing the BacktestResult schema (task 10.2).
+    if runtime.cbbc_adapter is not None:
+        try:
+            _cbbc_summary = runtime.cbbc_adapter.summary()
+            warnings.add(
+                f"cbbc_magnet_layer_enabled:{runtime.cbbc_layer_active}"
+            )
+            warnings.add(f"cbbc_total_vetoed:{_cbbc_summary.total_vetoed}")
+            warnings.add(
+                f"cbbc_vetoed_dense_band_above:{_cbbc_summary.vetoed_dense_band_above}"
+            )
+            warnings.add(
+                f"cbbc_vetoed_dense_band_below:{_cbbc_summary.vetoed_dense_band_below}"
+            )
+            warnings.add(f"cbbc_control_total:{_cbbc_summary.control_total}")
+            warnings.add(
+                f"cbbc_snapshot_missing_days:{_cbbc_summary.cbbc_snapshot_missing_days}"
+            )
+        except Exception:  # noqa: BLE001
+            pass
     if runtime.breadth_used_count:
         warnings.add(f"breadth_used_count:{runtime.breadth_used_count}")
 

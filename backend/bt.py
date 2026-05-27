@@ -10,6 +10,19 @@ from trend_filter import (
     get_cum_trend_boundary_filter_reasons,
 )
 
+# CBBC magnet adapter wiring (cbbc-magnet-signal task 10.2). Best-effort:
+# missing modules / disk errors must never block the bt.py one-day run.
+try:
+    from cbbc_backtest_adapter import CbbcBacktestAdapter
+    from runtime_config_store import CBBC_FIELD_DEFAULTS, load_runtime_config
+    _CBBC_OK = True
+except Exception as _cbbc_err:  # noqa: BLE001
+    CbbcBacktestAdapter = None  # type: ignore[assignment]
+    CBBC_FIELD_DEFAULTS = {}
+    load_runtime_config = lambda: {}  # type: ignore[assignment]
+    _CBBC_OK = False
+    print(f"[CBBC] adapter unavailable: {_cbbc_err!r}")
+
 EXTREME_VOLUME_SURGE_MULTIPLIER = 1.3
 VERY_EXTREME_RSI_OVERBOUGHT = 85
 VERY_EXTREME_RSI_OVERSOLD = 16
@@ -88,10 +101,44 @@ pos = "none"; entry = 0.0; trades = []; et = ""
 last_take_profit_side = None; last_take_profit_time = None
 start_idx = max(VOL_MA_PERIOD, RSI_LENGTH) + 1
 
+# --- CBBC magnet adapter setup (task 10.2) -----------------------------------
+cbbc_adapter = None
+cbbc_skip_today = False
+if _CBBC_OK and CbbcBacktestAdapter is not None:
+    try:
+        _cfg_data = load_runtime_config()
+        _cfg_view = type("_CbbcCfg", (object,), {})()
+        for _key, _default in CBBC_FIELD_DEFAULTS.items():
+            setattr(_cfg_view, _key, _cfg_data.get(_key, _default))
+        cbbc_adapter = CbbcBacktestAdapter(
+            config=_cfg_view,
+            decay_points=float(_cfg_view.cbbc_magnet_decay_points),
+        )
+        _prep = cbbc_adapter.prepare_for_day(today)
+        cbbc_skip_today = bool(_prep.missing)
+        if cbbc_skip_today:
+            print(f"[CBBC] {today} no D-1 snapshot, magnet vetoes disabled for the day")
+        else:
+            print(f"[CBBC] magnet adapter ready (layer_enabled={_cfg_view.cbbc_magnet_layer_enabled})")
+    except Exception as _setup_err:  # noqa: BLE001
+        print(f"[CBBC] setup failed: {_setup_err!r}")
+        cbbc_adapter = None
+        cbbc_skip_today = True
+
+_MAGNET_BRANCHES = {"b1_volume_extreme", "b2_very_extreme_pullback", "b3_completed_k", "b4_shadow_reversal"}
+# -----------------------------------------------------------------------------
+
 for i in range(start_idx, len(d1)):
     r = d1.iloc[i]; p = d1.iloc[i-1]; t = d1.index[i]
     rsi = r["RSI"]; price = r["close"]; vol = r["vol"]; vma = r["VOL_MA"]
     if isnan(rsi) or isnan(vma): continue
+
+    # Feed HSI spot to the magnet engine on every bar (task 10.2).
+    if cbbc_adapter is not None and not cbbc_skip_today:
+        try:
+            cbbc_adapter.at_replay_ts(t.to_pydatetime() if hasattr(t, "to_pydatetime") else t, float(price))
+        except Exception:
+            pass
 
     cs = r["VWAP_SLOPE"]; ps = p["VWAP_SLOPE"] if not isnan(p["VWAP_SLOPE"]) else 0
     vwap_up = (ps <= 0 and cs > 0) or (cs > 0 and cs > ps)
@@ -152,6 +199,39 @@ for i in range(start_idx, len(d1)):
         if sig and last_take_profit_side == sig[0] and last_take_profit_time is not None:
             if (t - last_take_profit_time).total_seconds() < 180:
                 sig = None
+        # CBBC magnet veto for extreme branches (task 10.2). bt.py only
+        # detects b1_volume_extreme + b2_very_extreme_pullback (the
+        # ``ExtremeLow``/``ExtremeHigh``/``VeryExtreme...`` strings produced by
+        # extreme_signal()), so we can identify them by the desc prefix.
+        if (
+            sig is not None
+            and cbbc_adapter is not None
+            and not cbbc_skip_today
+        ):
+            _desc = sig[1]
+            _is_extreme_branch = (
+                _desc.startswith("Extreme") or _desc.startswith("VeryExtreme")
+            )
+            if _is_extreme_branch:
+                _mode = "极度超卖" if sig[0] == "bull" else "极度超买"
+                _branch = (
+                    "b2_very_extreme_pullback"
+                    if _desc.startswith("VeryExtreme")
+                    else "b1_volume_extreme"
+                )
+                try:
+                    _decision = cbbc_adapter.consult_extreme(
+                        sig[0], float(price),
+                        t.to_pydatetime() if hasattr(t, "to_pydatetime") else t,
+                        branch=_branch, mode=_mode,
+                    )
+                    if _decision is not None and getattr(_decision, "vetoed_by_cbbc_magnet", False):
+                        print("[%s] >> SKIP %s (cbbc_magnet_veto:%s)" % (
+                            t.strftime("%H:%M"), sig[0].upper(), _decision.reason_code,
+                        ))
+                        sig = None
+                except Exception as _veto_err:
+                    print(f"[CBBC] consult failed: {_veto_err!r}")
         if sig:
             pos, desc = sig; entry = price; et = t.strftime("%H:%M")
             d_str = "BULL" if pos == "bull" else "BEAR"
@@ -188,3 +268,14 @@ if n > 0:
         tag = "WIN " if x["r"] == "W" else "LOSS"
         print("  #%d %s %s->%s %s %.2f->%.2f %+.2fpts %+.2fHKD %dmin" % (
             i, tag, x["et"], x["t"], x["tp"], x["en"], x["ex"], x["d"], x["pnl"], x["dur"]))
+
+# CBBC magnet summary (task 10.2)
+if cbbc_adapter is not None:
+    try:
+        _s = cbbc_adapter.summary()
+        print("CBBC: total_vetoed=%d above=%d below=%d control_total=%d missing_days=%d" % (
+            _s.total_vetoed, _s.vetoed_dense_band_above, _s.vetoed_dense_band_below,
+            _s.control_total, _s.cbbc_snapshot_missing_days,
+        ))
+    except Exception as _err:
+        print(f"[CBBC] summary failed: {_err!r}")

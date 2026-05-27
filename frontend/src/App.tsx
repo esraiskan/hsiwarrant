@@ -7,19 +7,21 @@ import TradeLog from './components/TradeLog';
 import ControlPanel from './components/ControlPanel';
 import OpenDPanel from './components/OpenDPanel';
 import BacktestPanel from './components/BacktestPanel';
-import MarketRegimeBanner from './components/MarketRegimeBanner';
+import HksiStyleAiAdvisorPanel from './components/HksiStyleAiAdvisorPanel';
 import { useWebSocket } from './useWebSocket';
 import { colors } from './theme';
 import * as api from './api';
 import type { StrategyConfig } from './types';
 
 export default function App() {
-  const { connected, state, klines, trades, marketRegime, todayPnl, clearData, refreshData, refreshTodayPnl } = useWebSocket();
+  const { connected, state, klines, trades, marketRegime, todayPnl, magnetOverlay, cbbcZones, clearData, refreshData, refreshTodayPnl } = useWebSocket();
   const [actionLoading, setActionLoading] = useState<'start' | 'stop' | 'reset' | null>(null);
   const [rsiLength, setRsiLength] = useState(14);
+  const [aiAdvisorEnabled, setAiAdvisorEnabled] = useState(false);
 
   const handleConfigLoaded = useCallback((config: StrategyConfig) => {
     setRsiLength(config.rsi_length);
+    setAiAdvisorEnabled(Boolean(config.cbbc_ai_advisor_enabled));
   }, []);
 
   const handleStart = useCallback(async () => {
@@ -112,13 +114,12 @@ export default function App() {
                 label: '實盤監控',
                 children: (
                   <>
-                    <MarketRegimeBanner marketRegime={marketRegime} />
                     <OpenDPanel onTradeEnvChanged={refreshTodayPnl} />
-                    <StatusPanel state={state} connected={connected} todayPnl={todayPnl} />
+                    <StatusPanel state={state} connected={connected} todayPnl={todayPnl} magnetOverlay={magnetOverlay} marketRegime={marketRegime} cbbcZones={cbbcZones} aiAdvisorEnabled={aiAdvisorEnabled} />
 
                     <Row gutter={16}>
                       <Col xs={24} lg={17}>
-                        <PriceChart klines={klines} trades={trades} entryPrice={state?.entry_price ?? 0} rsiLength={rsiLength} />
+                        <PriceChart klines={klines} trades={trades} entryPrice={state?.entry_price ?? 0} rsiLength={rsiLength} magnetOverlay={magnetOverlay} />
                       </Col>
                       <Col xs={24} lg={7}>
                         <ControlPanel
@@ -135,6 +136,11 @@ export default function App() {
                     <TradeLog trades={trades} />
                   </>
                 ),
+              },
+              {
+                key: 'ai-analysis',
+                label: 'AI 分析',
+                children: <HksiStyleAiAdvisorPanel enabled={aiAdvisorEnabled} />,
               },
               {
                 key: 'backtest',

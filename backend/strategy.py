@@ -20,11 +20,12 @@ from config import (
 )
 from models import (
     PositionType, TradeSignal, TradeRecord, StrategyState, KlineData, MarketRegime,
+    MagnetConsultRecord,
 )
 from futu_data import FutuDataSource
 from futu_trader import FutuTrader
 from market_regime import classify_market_regime
-from runtime_config_store import load_runtime_config, save_runtime_config
+from runtime_config_store import load_runtime_config, save_runtime_config, CBBC_FIELD_DEFAULTS
 from strategy_state_store import load_strategy_state, save_strategy_state
 from trade_log_store import append_trade_log, load_trade_log
 from momentum_filter import get_momentum_filter_reasons
@@ -33,6 +34,26 @@ from trend_filter import (
     get_cum_trend_boundary_filter_reasons,
     get_cum_trend_filter_reasons,
 )
+
+# CBBC magnet signal layer (cbbc-magnet-signal). Imports are best-effort: missing
+# modules must not block the strategy engine from starting (R10.6 fail-safe).
+try:
+    from cbbc_signal_adapter import (
+        ConsultDecision as _CbbcConsultDecision,
+        MagnetSignalAdapter as _CbbcMagnetSignalAdapter,
+    )
+    from cbbc_calculator import MagnetEngine as _CbbcMagnetEngine
+    from cbbc_storage import CbbcStorage as _CbbcStorage
+    _CBBC_IMPORTS_OK = True
+except Exception as _cbbc_import_exc:  # noqa: BLE001 - fail-safe at import time
+    _CbbcConsultDecision = None  # type: ignore[assignment]
+    _CbbcMagnetSignalAdapter = None  # type: ignore[assignment]
+    _CbbcMagnetEngine = None  # type: ignore[assignment]
+    _CbbcStorage = None  # type: ignore[assignment]
+    _CBBC_IMPORTS_OK = False
+    _CBBC_IMPORT_ERROR: BaseException | None = _cbbc_import_exc
+else:
+    _CBBC_IMPORT_ERROR = None
 
 
 def _is_nan(value) -> bool:
@@ -298,8 +319,66 @@ class HSIStrategyEngine:
         self.extreme_rsi_stop_rearm_ticks = EXTREME_RSI_STOP_REARM_TICKS
         self.bull_warrant_code = BULL_WARRANT_CODE
         self.bear_warrant_code = BEAR_WARRANT_CODE
+
+        # ---- CBBC magnet signal layer (cbbc-magnet-signal) -------------
+        # Runtime config snapshot — defaults aligned with runtime_config_store
+        # CBBC_FIELD_DEFAULTS. _load_runtime_config below may override these
+        # before _init_cbbc_components builds the engine/adapter.
+        self.cbbc_magnet_layer_enabled: bool = bool(
+            CBBC_FIELD_DEFAULTS["cbbc_magnet_layer_enabled"]
+        )
+        self.cbbc_intraday_polling_suspended: bool = bool(
+            CBBC_FIELD_DEFAULTS["cbbc_intraday_polling_suspended"]
+        )
+        self.cbbc_magnet_decay_points: float = float(
+            CBBC_FIELD_DEFAULTS["cbbc_magnet_decay_points"]
+        )
+        self.cbbc_dense_band_threshold_pts: float = float(
+            CBBC_FIELD_DEFAULTS["cbbc_dense_band_threshold_pts"]
+        )
+        self.cbbc_dense_band_pull_share: float = float(
+            CBBC_FIELD_DEFAULTS["cbbc_dense_band_pull_share"]
+        )
+        self.cbbc_intraday_poll_interval_seconds: float = float(
+            CBBC_FIELD_DEFAULTS["cbbc_intraday_poll_interval_seconds"]
+        )
+        # 磁吸方向闸门 (UX 增强,默认关闭)
+        self.cbbc_magnet_direction_gate_enabled: bool = bool(
+            CBBC_FIELD_DEFAULTS["cbbc_magnet_direction_gate_enabled"]
+        )
+        self.cbbc_magnet_direction_gate_threshold: float = float(
+            CBBC_FIELD_DEFAULTS["cbbc_magnet_direction_gate_threshold"]
+        )
+        # CBBC AI 决策顾问 (UX 增强,默认关闭;不影响任何交易决策)
+        self.cbbc_ai_advisor_enabled: bool = bool(
+            CBBC_FIELD_DEFAULTS["cbbc_ai_advisor_enabled"]
+        )
+        self.cbbc_ai_advisor_base_url: str = str(
+            CBBC_FIELD_DEFAULTS["cbbc_ai_advisor_base_url"]
+        )
+        self.cbbc_ai_advisor_model: str = str(
+            CBBC_FIELD_DEFAULTS["cbbc_ai_advisor_model"]
+        )
+        self.cbbc_ai_advisor_api_key: str = str(
+            CBBC_FIELD_DEFAULTS["cbbc_ai_advisor_api_key"]
+        )
+        self.cbbc_ai_advisor_api_style: str = str(
+            CBBC_FIELD_DEFAULTS["cbbc_ai_advisor_api_style"]
+        )
+        # Live components — populated by _init_cbbc_components after config load.
+        self._cbbc_storage = None
+        self._cbbc_magnet_engine = None
+        self._cbbc_magnet_adapter = None
+        self._cbbc_data_service = None
+        # Periodic Futu refresh task handle (asyncio.Task | None) — set up
+        # in ``start_cbbc_data_service`` and cancelled in ``stop_cbbc_data_service``.
+        self._cbbc_futu_refresh_task = None
+        # Last consult record (kept on the engine for state snapshot / observability).
+        self._last_magnet_consult: MagnetConsultRecord | None = None
+
         self._load_runtime_config()
         self._load_runtime_state()
+        self._init_cbbc_components()
 
     def get_state(self, sync_exit: bool = True) -> StrategyState:
         if sync_exit:
@@ -344,6 +423,12 @@ class HSIStrategyEngine:
             win_count=self.win_count,
             loss_count=self.loss_count,
             is_running=self.is_running,
+            cbbc_magnet_layer_enabled=bool(self.cbbc_magnet_layer_enabled),
+            cbbc_magnet_degraded=self._cbbc_magnet_is_degraded(),
+            cbbc_magnet_bias=self._cbbc_latest_bias(),
+            cbbc_nearest_bull_distance_pts=self._cbbc_latest_nearest_bull_distance(),
+            cbbc_nearest_bear_distance_pts=self._cbbc_latest_nearest_bear_distance(),
+            last_magnet_consult=self._last_magnet_consult,
         )
 
     def update_config(self, **kwargs):
@@ -365,6 +450,23 @@ class HSIStrategyEngine:
                     setattr(self, key, value)
         if "target_pnl" in kwargs or "er_ratio" in kwargs or "share_count" in kwargs:
             self.stop_points = self._stop_points_for_pnl(self.target_pnl)
+        # If any CBBC field changed, re-apply it to the live magnet engine /
+        # adapter (task 7.2). update_config swallows internal exceptions so a
+        # bad knob can't break /api/config.
+        if any(
+            k in kwargs
+            for k in (
+                "cbbc_magnet_layer_enabled",
+                "cbbc_intraday_polling_suspended",
+                "cbbc_magnet_decay_points",
+                "cbbc_dense_band_threshold_pts",
+                "cbbc_dense_band_pull_share",
+                "cbbc_intraday_poll_interval_seconds",
+                "cbbc_magnet_direction_gate_enabled",
+                "cbbc_magnet_direction_gate_threshold",
+            )
+        ):
+            self._sync_cbbc_runtime_config()
         self._save_runtime_config()
 
     def _normalize_enabled_strategies(self, value) -> list[str]:
@@ -440,6 +542,749 @@ class HSIStrategyEngine:
             message=f"【{label}·{mode}】跳过: {reason}",
         ))
 
+    # ------------------------------------------------------------------
+    # CBBC magnet signal layer integration (cbbc-magnet-signal task 7.2/7.3)
+    # ------------------------------------------------------------------
+    def _init_cbbc_components(self) -> None:
+        """Build CBBC storage + magnet engine + signal adapter (task 7.2).
+
+        All failures are swallowed: a misbehaving CBBC layer must never block
+        the main strategy loop (R10.6 fail-safe). On any error we mark the
+        adapter as ``None`` so the consult helper short-circuits.
+        """
+        if not _CBBC_IMPORTS_OK:
+            print(
+                f"[CBBC] CBBC modules unavailable, magnet layer disabled: "
+                f"{_CBBC_IMPORT_ERROR!r}"
+            )
+            return
+        try:
+            # Storage is constructed for parity with task 4.5 wiring; the engine
+            # itself does not need it directly — snapshots are pushed in by the
+            # data service when wired (task 4.5). Keeping a handle here lets
+            # CbbcDataService share the same storage instance later.
+            self._cbbc_storage = _CbbcStorage()
+            self._cbbc_magnet_engine = _CbbcMagnetEngine(
+                decay_points=float(self.cbbc_magnet_decay_points),
+                # 实盘 run_strategy_check 间隔通常 30~60s,默认 5s stale 太苛刻;
+                # 给 magnet engine 足够时间窗口接收下一帧 HSI 现价。
+                hsi_stale_seconds=180.0,
+            )
+            # HK tz-aware clock so the adapter's degradation lifecycle
+            # comparison matches CbbcDataService.last_refresh_ts_hk (also
+            # HK-aware). Mixing naive + aware datetimes raises TypeError
+            # and force-degrades the layer.
+            from zoneinfo import ZoneInfo as _Zi
+
+            class _HkClock:
+                def now_hk(self) -> datetime:
+                    return datetime.now(_Zi("Asia/Hong_Kong"))
+
+            self._cbbc_magnet_adapter = _CbbcMagnetSignalAdapter(
+                calculator=self._cbbc_magnet_engine,
+                config=self,
+                clock=_HkClock(),
+                last_refresh_provider=self._cbbc_data_service_last_refresh,
+                snapshot_provider=self._cbbc_data_service_snapshot,
+            )
+            # task 4.5: build the data service but DO NOT start it here. The
+            # FastAPI lifespan / start() path schedules the asyncio tasks on
+            # the right event loop.
+            try:
+                from cbbc_data import CbbcDataService as _CbbcDataServiceCls
+                self._cbbc_data_service = _CbbcDataServiceCls(
+                    storage=self._cbbc_storage,
+                    runtime_config=self,
+                    decay_pts_provider=lambda: float(self.cbbc_magnet_decay_points),
+                    poll_interval_provider=lambda: float(
+                        self.cbbc_intraday_poll_interval_seconds
+                    ),
+                    on_snapshot_changed=self._on_cbbc_snapshot_changed,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[CBBC] data service unavailable: {exc!r}")
+                self._cbbc_data_service = None
+        except Exception as exc:  # noqa: BLE001 - fail-safe at init
+            print(f"[CBBC] failed to initialize magnet components: {exc!r}")
+            self._cbbc_storage = None
+            self._cbbc_magnet_engine = None
+            self._cbbc_magnet_adapter = None
+            self._cbbc_data_service = None
+
+    # ------------------------------------------------------------------
+    # _RuntimeConfigPersistence + lifecycle hooks for CbbcDataService
+    # ------------------------------------------------------------------
+    def is_intraday_polling_suspended(self) -> bool:
+        return bool(self.cbbc_intraday_polling_suspended)
+
+    def set_intraday_polling_suspended(self, suspended: bool) -> None:
+        self.cbbc_intraday_polling_suspended = bool(suspended)
+        try:
+            self._save_runtime_config()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_cbbc_snapshot_changed(self, snapshot) -> None:
+        """Push a freshly-loaded / merged CBBC snapshot into the magnet engine."""
+        engine = self._cbbc_magnet_engine
+        if engine is None:
+            return
+        try:
+            engine.update_snapshot(snapshot)
+        except Exception:  # noqa: BLE001 - never let snapshot push break things
+            pass
+
+    def _cbbc_data_service_last_refresh(self):
+        svc = getattr(self, "_cbbc_data_service", None)
+        if svc is None:
+            return None
+        try:
+            return svc.last_refresh_ts_hk()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _cbbc_data_service_snapshot(self):
+        svc = getattr(self, "_cbbc_data_service", None)
+        if svc is None:
+            return None
+        try:
+            return svc.current_snapshot()
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def start_cbbc_data_service(self) -> None:
+        """Start the CbbcDataService background tasks. Safe to call multiple times.
+
+        Called by the FastAPI lifespan in main.py (task 9.1).
+
+        Also kicks off the periodic Futu refresh loop (every 5 min by default)
+        so we cover the gap between snapshot抓取 and intraday recall events
+        — without it, contracts that get force-recalled mid-session stay
+        showing stale ``street_vol`` until 18:00 daily fetch.
+        """
+        svc = getattr(self, "_cbbc_data_service", None)
+        if svc is None:
+            return
+        # Best-effort: seed today's snapshot from Futu before the daily
+        # scheduler kicks in. Falls back to whatever ``CbbcStorage.latest_before``
+        # has when the seed step fails (e.g. OpenD offline).
+        await self._maybe_seed_cbbc_from_futu()
+        # Also pull today's HSI high/low immediately so the kill-filter is
+        # primed before any consult fires.
+        try:
+            from datetime import datetime as _dt
+            from zoneinfo import ZoneInfo as _Zi
+            today_hk = _dt.now(_Zi("Asia/Hong_Kong")).date()
+            await self._refresh_today_extremes_from_futu(today_hk)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CBBC] today extremes initial fetch failed: {exc!r}")
+        try:
+            await svc.start()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CBBC] data service start failed: {exc!r}")
+
+        # Spin up the periodic Futu refresher. We only schedule it once per
+        # engine lifetime; ``stop_cbbc_data_service`` cancels it on shutdown.
+        if getattr(self, "_cbbc_futu_refresh_task", None) is None:
+            try:
+                self._cbbc_futu_refresh_task = asyncio.create_task(
+                    self._cbbc_futu_refresh_loop(),
+                    name="cbbc_futu_refresh_loop",
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[CBBC] futu refresh loop kickoff failed: {exc!r}")
+
+    async def _cbbc_futu_refresh_loop(self) -> None:
+        """Periodically re-pull HSI CBBC outstanding from Futu during HK
+        trading sessions to catch mid-session forced recalls (R2.6 spirit,
+        but using Futu instead of HKEX endpoints).
+
+        Interval defaults to 5 minutes; first iteration sleeps the interval
+        BEFORE running (the seed call already covers t=0).
+        """
+        try:
+            from cbbc_storage import is_hk_trading_day
+            from datetime import datetime as _dt, time as _time
+            from zoneinfo import ZoneInfo as _Zi
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CBBC] futu refresh loop disabled (imports): {exc!r}")
+            return
+
+        interval_seconds = 300.0  # 5 minutes — easy to expose in runtime_config later
+        morning_start = _time(9, 30, 0)
+        morning_end = _time(12, 0, 0)
+        afternoon_start = _time(13, 0, 0)
+        afternoon_end = _time(16, 0, 0)
+
+        while True:
+            try:
+                await asyncio.sleep(interval_seconds)
+            except asyncio.CancelledError:
+                return
+
+            try:
+                now_hk = _dt.now(_Zi("Asia/Hong_Kong"))
+                today_hk = now_hk.date()
+                t = now_hk.timetz().replace(tzinfo=None)
+                # Only refresh during HK trading sessions on trading days.
+                if not is_hk_trading_day(today_hk):
+                    continue
+                in_session = (
+                    (morning_start <= t <= morning_end)
+                    or (afternoon_start <= t <= afternoon_end)
+                )
+                if not in_session:
+                    continue
+
+                await self._refresh_cbbc_from_futu(today_hk)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # noqa: BLE001
+                print(f"[CBBC] futu refresh loop iteration failed: {exc!r}")
+
+    async def _refresh_cbbc_from_futu(self, today_hk) -> None:
+        """Re-pull today's HSI CBBC from Futu and push the new snapshot to
+        the magnet engine.
+
+        Unlike ``_maybe_seed_cbbc_from_futu`` we **do not write to disk** —
+        the on-disk parquet stays as the morning seed (snapshot immutability,
+        spec R3.3). The fresh Futu data only refreshes the in-memory snapshot
+        used by the magnet engine + WS overlay, so already-recalled contracts
+        instantly disappear from the picture.
+
+        We also opportunistically push today's HSI high/low into the magnet
+        engine so the kill-filter (B) covers any extremes the engine missed
+        before strategy.start() got called.
+        """
+        try:
+            from cbbc_data_futu import FutuCbbcSource
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CBBC] futu refresh skipped (imports): {exc!r}")
+            return
+
+        try:
+            source = FutuCbbcSource()
+            loop = asyncio.get_running_loop()
+            snapshot = await loop.run_in_executor(
+                None, source.fetch_outstanding, today_hk,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CBBC] futu refresh fetch failed: {exc!r}")
+            return
+
+        if not snapshot.records:
+            print("[CBBC] futu refresh: empty snapshot, keeping previous")
+            return
+
+        live = sum(1 for r in snapshot.records if r.outstanding_shares > 0)
+        print(f"[CBBC] futu refresh: {live}/{len(snapshot.records)} live records")
+
+        try:
+            self._on_cbbc_snapshot_changed(snapshot)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CBBC] futu refresh push failed: {exc!r}")
+
+        # Pull today's HSI high/low from the live FutuData snapshot and
+        # update the magnet engine's kill-filter inputs. This catches early-
+        # session extremes that occurred before strategy.start().
+        await self._refresh_today_extremes_from_futu(today_hk)
+
+    async def _refresh_today_extremes_from_futu(self, today_hk) -> None:
+        """Best-effort pull of HSI today_low / today_high via the existing
+        FutuDataSource ``get_snapshot`` plumbing, and push to the magnet
+        engine via ``set_today_extremes``.
+        """
+        engine = self._cbbc_magnet_engine
+        if engine is None or not hasattr(engine, "set_today_extremes"):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+            snap = await loop.run_in_executor(None, self.data_source.get_snapshot)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CBBC] futu HSI snapshot fetch failed: {exc!r}")
+            return
+        if not snap:
+            return
+        try:
+            high = float(snap.get("high_price", 0) or 0)
+            low = float(snap.get("low_price", 0) or 0)
+        except Exception:  # noqa: BLE001
+            return
+        if high <= 0 and low <= 0:
+            return
+        try:
+            cur_low, cur_high = engine.get_today_extremes()
+            # Merge with whatever the engine already has — take the more
+            # extreme value on each side.
+            merged_low = low if cur_low is None else min(cur_low, low) if low > 0 else cur_low
+            merged_high = high if cur_high is None else max(cur_high, high) if high > 0 else cur_high
+            engine.set_today_extremes(
+                today_low=merged_low,
+                today_high=merged_high,
+                for_date=today_hk,
+            )
+            print(f"[CBBC] today extremes from Futu: low={merged_low:.2f} high={merged_high:.2f}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CBBC] set_today_extremes failed: {exc!r}")
+
+    async def _maybe_seed_cbbc_from_futu(self) -> None:
+        """One-shot fetch of today's HSI CBBC snapshot via Futu OpenAPI.
+
+        - Skips when the snapshot for today already exists on disk.
+        - Skips when ``cbbc_data_futu`` import fails (futu SDK absent).
+        - Runs on a worker thread so it doesn't block the event loop.
+        - All exceptions are swallowed: this is a convenience seed, never
+          a hard requirement.
+        """
+        storage = self._cbbc_storage
+        if storage is None:
+            return
+        try:
+            from cbbc_data_futu import FutuCbbcSource
+            from cbbc_storage import is_hk_trading_day, SnapshotError
+            from datetime import datetime as _dt
+            from zoneinfo import ZoneInfo as _Zi
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CBBC] futu seed skipped (imports): {exc!r}")
+            return
+
+        try:
+            today_hk = _dt.now(_Zi("Asia/Hong_Kong")).date()
+        except Exception:  # noqa: BLE001
+            return
+
+        # Already have today's snapshot? Don't re-fetch.
+        try:
+            if is_hk_trading_day(today_hk):
+                existing = storage.read_snapshot(today_hk)
+                if existing.records:
+                    print(f"[CBBC] futu seed skipped: snapshot for {today_hk} already exists ({len(existing.records)} records)")
+                    # Push to engine so the magnet engine has data even when
+                    # the daily scheduler does nothing.
+                    self._on_cbbc_snapshot_changed(existing)
+                    return
+        except SnapshotError:
+            pass  # missing → proceed to fetch
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CBBC] futu seed read existing failed: {exc!r}")
+
+        # Fetch from Futu on a worker thread.
+        try:
+            source = FutuCbbcSource()
+            loop = asyncio.get_running_loop()
+            snapshot = await loop.run_in_executor(
+                None, source.fetch_outstanding, today_hk,
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CBBC] futu seed fetch failed: {exc!r}")
+            return
+
+        if not snapshot.records:
+            print("[CBBC] futu seed: no records returned, skipping write")
+            return
+
+        # Persist (storage rejects overwrite; non-trading days etc. just bubble up).
+        try:
+            storage.write_snapshot(snapshot)
+            print(f"[CBBC] futu seed wrote snapshot for {today_hk} ({len(snapshot.records)} records)")
+        except SnapshotError as exc:
+            # snapshot_immutable means it appeared between our read and write
+            # (race with the scheduler). Push the in-memory copy anyway.
+            print(f"[CBBC] futu seed write skipped: {exc!s}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CBBC] futu seed write failed: {exc!r}")
+
+        # Forward to the magnet engine so consult_for_extreme has data.
+        try:
+            self._on_cbbc_snapshot_changed(snapshot)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def stop_cbbc_data_service(self) -> None:
+        # Cancel the periodic refresh loop first — it might be sleeping mid-iteration.
+        task = getattr(self, "_cbbc_futu_refresh_task", None)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._cbbc_futu_refresh_task = None
+
+        svc = getattr(self, "_cbbc_data_service", None)
+        if svc is None:
+            return
+        try:
+            await svc.stop()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CBBC] data service stop failed: {exc!r}")
+
+    def _sync_cbbc_runtime_config(self) -> None:
+        """Re-apply runtime CBBC config to live components (task 7.2).
+
+        Called from ``__init__`` (after engine creation) and from
+        ``update_config`` whenever any CBBC field changes. Errors are
+        swallowed so a single bad knob can't crash the strategy.
+        """
+        engine = self._cbbc_magnet_engine
+        if engine is None:
+            return
+        try:
+            engine.update_decay_points(float(self.cbbc_magnet_decay_points))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[CBBC] update_decay_points failed: {exc!r}")
+        # cbbc_dense_band_threshold_pts / cbbc_dense_band_pull_share are
+        # consumed lazily by MagnetSignalAdapter via the RuntimeConfigView
+        # protocol (the engine reads them off ``self`` at consult time), so
+        # no further sync is required.
+
+    def _cbbc_magnet_is_degraded(self) -> bool:
+        adapter = self._cbbc_magnet_adapter
+        if adapter is None:
+            # No live adapter means we cannot run the layer at all. Surface
+            # this as "degraded" only when the operator has actually enabled
+            # the layer; otherwise report False so the UI doesn't show a
+            # spurious warning while CBBC is intentionally off.
+            return bool(self.cbbc_magnet_layer_enabled)
+        try:
+            return bool(adapter.cbbc_magnet_degraded)
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _cbbc_latest_result(self):
+        engine = self._cbbc_magnet_engine
+        if engine is None:
+            return None
+        try:
+            return engine.latest()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _cbbc_latest_bias(self) -> Optional[float]:
+        result = self._cbbc_latest_result()
+        if result is None:
+            return None
+        try:
+            bias = float(result.magnet_bias)
+        except Exception:  # noqa: BLE001
+            return None
+        return bias if math.isfinite(bias) else None
+
+    def _cbbc_latest_nearest_bull_distance(self) -> Optional[float]:
+        result = self._cbbc_latest_result()
+        if result is None:
+            return None
+        value = result.nearest_bull_distance_pts
+        return float(value) if value is not None else None
+
+    def _cbbc_latest_nearest_bear_distance(self) -> Optional[float]:
+        result = self._cbbc_latest_result()
+        if result is None:
+            return None
+        value = result.nearest_bear_distance_pts
+        return float(value) if value is not None else None
+
+    @staticmethod
+    def _parse_kline_time_for_magnet(kline_time: str) -> datetime:
+        """Best-effort parse of an HSI K-line timestamp string into a datetime.
+
+        Falls back to ``datetime.now()`` when the input cannot be parsed,
+        guaranteeing the consult call always has a valid ``ts_hk``.
+        """
+        if not kline_time:
+            return datetime.now()
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%H:%M:%S", "%H:%M"):
+            try:
+                return datetime.strptime(kline_time, fmt)
+            except ValueError:
+                continue
+        return datetime.now()
+
+    def _feed_cbbc_magnet_engine_hsi_spot(self, price: float) -> None:
+        """Push the latest HSI spot into the CBBC magnet engine.
+
+        Swallows all exceptions: keeping the magnet layer up-to-date must
+        never break the main quote loop. ``MagnetEngineError`` (e.g. stale
+        HSI) is fine to catch silently because the adapter already inspects
+        ``hsi_spot_stale`` on each consult.
+        """
+        engine = self._cbbc_magnet_engine
+        if engine is None:
+            return
+        try:
+            if not math.isfinite(price):
+                return
+            # Use a tz-aware HK timestamp so it's compatible with the engine's
+            # default HK clock (mixing naive + aware datetimes raises
+            # TypeError inside ``_gap_seconds``).
+            from zoneinfo import ZoneInfo as _Zi
+            engine.update_hsi_spot(float(price), datetime.now(_Zi("Asia/Hong_Kong")))
+        except Exception:  # noqa: BLE001 - fail-safe per R10.6
+            pass
+
+    def _consult_cbbc_magnet_for_extreme(
+        self,
+        side: PositionType,
+        hsi_price: float,
+        kline_time: str,
+    ):
+        """Consult the CBBC magnet adapter before submitting an extreme entry.
+
+        Returns ``None`` if no decision could be obtained (component missing
+        or unexpected exception). Otherwise returns the ``ConsultDecision``
+        and records a ``MagnetConsultRecord`` on the engine for state
+        snapshots.
+
+        Wraps every call in try/except (R10.6): a failure inside the CBBC
+        layer never blocks the main strategy loop. On exception we mark the
+        adapter as degraded via ``mark_degraded_due_to_external_failure`` so
+        subsequent consults short-circuit to a fail-safe path.
+        """
+        adapter = self._cbbc_magnet_adapter
+        if adapter is None:
+            return None
+        ts_hk = self._parse_kline_time_for_magnet(kline_time)
+        extreme_direction = "BULL" if side == PositionType.BULL else "BEAR"
+        try:
+            decision = adapter.consult_for_extreme(
+                extreme_direction,
+                float(hsi_price),
+                ts_hk,
+            )
+        except Exception as exc:  # noqa: BLE001 — R10.6 fail-safe
+            print(f"[CBBC] consult_for_extreme raised: {exc!r}")
+            try:
+                adapter.mark_degraded_due_to_external_failure(
+                    reason=f"consult_for_extreme:{type(exc).__name__}",
+                    ts_hk=ts_hk,
+                )
+            except Exception:  # noqa: BLE001 — never let the safety net throw
+                pass
+            return None
+
+        # Record the decision for /api/state visibility. Observability code
+        # must never break the trade path.
+        try:
+            event = (
+                "cbbc_magnet_consult_unavailable"
+                if not decision.magnet_available
+                else "cbbc_magnet_consult"
+            )
+            self._last_magnet_consult = MagnetConsultRecord(
+                event=event,
+                extreme_direction=extreme_direction,
+                nearest_bull_distance_pts=decision.nearest_bull_distance_pts,
+                nearest_bear_distance_pts=decision.nearest_bear_distance_pts,
+                magnet_bias=decision.magnet_bias,
+                magnet_available=bool(decision.magnet_available),
+                magnet_aligned_against_reversal=bool(
+                    decision.magnet_aligned_against_reversal
+                ),
+                vetoed_by_cbbc_magnet=bool(decision.vetoed_by_cbbc_magnet),
+                reason_code=str(decision.reason_code),
+                ts_hk=ts_hk.isoformat(),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+        return decision
+
+    async def _maybe_apply_cbbc_magnet_veto(
+        self,
+        side: PositionType,
+        hsi_price: float,
+        rsi: float,
+        kline_time: str,
+        mode: str,
+    ) -> bool:
+        """Run the CBBC magnet consult and apply the veto if any.
+
+        Returns ``True`` when the entry was vetoed (caller must skip the
+        ``_submit_entry_order`` call). Returns ``False`` when the entry
+        should proceed (consult cleared, layer disabled, fail-safe path, or
+        the component itself is unavailable).
+        """
+        decision = self._consult_cbbc_magnet_for_extreme(side, hsi_price, kline_time)
+        if decision is None:
+            return False
+        if not decision.vetoed_by_cbbc_magnet:
+            return False
+        await self._emit_strategy_disabled_skip(
+            side,
+            hsi_price,
+            rsi,
+            kline_time,
+            mode,
+            f"cbbc_magnet_veto:{decision.reason_code}",
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # CBBC magnet direction gate (UX 增强 — 全局方向闸门)
+    # ------------------------------------------------------------------
+    def _cbbc_magnet_direction_gate_block_reason(
+        self, side: PositionType
+    ) -> str | None:
+        """Return a non-empty reason string when the magnet direction gate
+        blocks ``side``, otherwise ``None``.
+
+        Resistance vs fuel disambiguation
+        ---------------------------------
+        Raw ``bias > 0`` means bear-side pull dominates,but the same condition
+        carries two opposite trading meanings:
+
+        - **resistance**: 上方街货群在贴身阻挡 (``nearest_bear < nearest_bull``)
+          AND 当前 HSI 没有强势向上 → 真阻力,反向入场被吸 → 阻 BULL。
+        - **fuel**: 价格正在向上突破熊证密集带 (``nearest_bear < nearest_bull``
+          且 HSI 在向上),或下方反而更近 (``nearest_bull < nearest_bear``,
+          已经穿越) → 顺势加速 → 不阻止任何方向。
+
+        We mirror this for ``bias < 0``. ``balanced`` (``|bias| < threshold``)
+        and ``unknown`` (missing data) never block.
+
+        Knobs aligned with frontend ``magnetInsight``:
+        - ``NEAREST_ASYMMETRY_TOL = 30pt``: 距离差小于 30pt 视为对称
+        - ``DAY_MOVE_DIRECTIONAL_PTS = 50pt``: HSI 当日相对开盘 ±50pt 内视为横盘
+        """
+        if not self.cbbc_magnet_direction_gate_enabled:
+            return None
+        if not self.cbbc_magnet_layer_enabled:
+            return None
+        if self._cbbc_magnet_is_degraded():
+            return None
+
+        result = self._cbbc_latest_result()
+        if result is None:
+            return None
+        if getattr(result, "hsi_spot_stale", False):
+            return None
+
+        try:
+            bias = float(result.magnet_bias)
+        except Exception:  # noqa: BLE001
+            return None
+        if not math.isfinite(bias):
+            return None
+
+        try:
+            threshold = float(self.cbbc_magnet_direction_gate_threshold)
+        except Exception:  # noqa: BLE001
+            threshold = 0.15
+        if not math.isfinite(threshold) or threshold <= 0.0:
+            return None
+
+        if abs(bias) < threshold:
+            return None
+
+        # Resistance vs fuel — mirrors frontend magnetInsight.computeMagnetInsight.
+        nearest_bull = result.nearest_bull_distance_pts
+        nearest_bear = result.nearest_bear_distance_pts
+        nearest_side: str  # "bull" closer | "bear" closer | "symmetric"
+        if nearest_bull is None or nearest_bear is None:
+            nearest_side = "symmetric"
+        else:
+            diff = nearest_bear - nearest_bull
+            if abs(diff) < 30.0:
+                nearest_side = "symmetric"
+            else:
+                nearest_side = "bull" if diff > 0 else "bear"
+
+        # Day movement: HSI close - day open, threshold 50pt.
+        day_move: str  # "up" | "down" | "flat"
+        try:
+            day_open = self._current_day_open_for_magnet()
+            spot = float(result.hsi_spot)
+        except Exception:  # noqa: BLE001
+            day_open = None
+            spot = None
+        if day_open is None or spot is None or not math.isfinite(spot):
+            day_move = "flat"
+        else:
+            move = spot - day_open
+            if abs(move) < 50.0:
+                day_move = "flat"
+            else:
+                day_move = "up" if move > 0 else "down"
+
+        # Decision tree.
+        if bias >= threshold:
+            # Bear pull dominates.
+            if nearest_side == "bear" and day_move != "up":
+                # 真阻力 — 阻止 BULL,允许 BEAR
+                if side == PositionType.BULL:
+                    return (
+                        f"cbbc_magnet_direction_gate:bias={bias:+.2f},"
+                        f"上方街货阻力 (nearest_bear<nearest_bull,HSI 未上行),警惕做多"
+                    )
+                return None
+            # 燃料场景 — 价格已穿越或正在突破上方密集带,不阻止任何方向
+            return None
+
+        # bias <= -threshold: bull pull dominates.
+        if nearest_side == "bull" and day_move != "down":
+            if side == PositionType.BEAR:
+                return (
+                    f"cbbc_magnet_direction_gate:bias={bias:+.2f},"
+                    f"下方街货支撑 (nearest_bull<nearest_bear,HSI 未下行),警惕做空"
+                )
+            return None
+        return None
+
+    def _current_day_open_for_magnet(self) -> float | None:
+        """Best-effort fetch of today's HSI open for the direction gate.
+
+        Pulled from the cached ``self.market_regime`` (computed once per
+        completed K-line by ``run_strategy_check``). Returns ``None`` when
+        regime is missing or day_open is invalid; callers must treat that
+        as "no directional info".
+        """
+        regime = self.market_regime
+        if regime is None:
+            return None
+        try:
+            v = regime.day_open
+        except Exception:  # noqa: BLE001
+            return None
+        if v is None:
+            return None
+        try:
+            f = float(v)
+        except Exception:  # noqa: BLE001
+            return None
+        if not math.isfinite(f) or f <= 0:
+            return None
+        return f
+
+    async def _maybe_block_by_magnet_direction_gate(
+        self,
+        side: PositionType,
+        hsi_price: float,
+        rsi: float,
+        kline_time: str,
+        mode: str,
+    ) -> bool:
+        """If the gate blocks ``side``, emit the standard skip log and return
+        ``True`` (caller must NOT submit). Otherwise return ``False``.
+
+        Uses ``_emit_strategy_disabled_skip`` so the skip shows up in the
+        same ``trade_log.csv`` stream as other strategy-skip events.
+        """
+        try:
+            reason = self._cbbc_magnet_direction_gate_block_reason(side)
+        except Exception:  # noqa: BLE001 - fail-safe per R10.6 conventions
+            return False
+        if reason is None:
+            return False
+        await self._emit_strategy_disabled_skip(
+            side,
+            hsi_price,
+            rsi,
+            kline_time,
+            mode,
+            reason,
+        )
+        return True
+
     def _stop_points_for_pnl(self, pnl_hkd: float) -> float:
         if self.share_count <= 0:
             return 0.0
@@ -473,6 +1318,27 @@ class HSIStrategyEngine:
             "extreme_rsi_stop_veto_enabled": self.extreme_rsi_stop_veto_enabled,
             "extreme_rsi_stop_hard_ticks": self.extreme_rsi_stop_hard_ticks,
             "extreme_rsi_stop_rearm_ticks": self.extreme_rsi_stop_rearm_ticks,
+            # CBBC magnet signal layer (cbbc-magnet-signal R9.1, R9.5, R9.7)
+            "cbbc_magnet_layer_enabled": bool(self.cbbc_magnet_layer_enabled),
+            "cbbc_intraday_polling_suspended": bool(self.cbbc_intraday_polling_suspended),
+            "cbbc_magnet_decay_points": float(self.cbbc_magnet_decay_points),
+            "cbbc_dense_band_threshold_pts": float(self.cbbc_dense_band_threshold_pts),
+            "cbbc_dense_band_pull_share": float(self.cbbc_dense_band_pull_share),
+            "cbbc_intraday_poll_interval_seconds": float(
+                self.cbbc_intraday_poll_interval_seconds
+            ),
+            "cbbc_magnet_direction_gate_enabled": bool(
+                self.cbbc_magnet_direction_gate_enabled
+            ),
+            "cbbc_magnet_direction_gate_threshold": float(
+                self.cbbc_magnet_direction_gate_threshold
+            ),
+            # CBBC AI 决策顾问 (read-only;不影响交易决策)
+            "cbbc_ai_advisor_enabled": bool(self.cbbc_ai_advisor_enabled),
+            "cbbc_ai_advisor_base_url": str(self.cbbc_ai_advisor_base_url),
+            "cbbc_ai_advisor_model": str(self.cbbc_ai_advisor_model),
+            "cbbc_ai_advisor_api_key": str(self.cbbc_ai_advisor_api_key),
+            "cbbc_ai_advisor_api_style": str(self.cbbc_ai_advisor_api_style),
         }
 
     def _save_runtime_config(self):
@@ -520,6 +1386,28 @@ class HSIStrategyEngine:
                 self.enabled_extreme_branches = self._normalize_enabled_extreme_branches(data["enabled_extreme_branches"])
             if "extreme_rsi_stop_veto_enabled" in data:
                 self.extreme_rsi_stop_veto_enabled = bool(data["extreme_rsi_stop_veto_enabled"])
+            # ---- CBBC magnet signal layer (cbbc-magnet-signal R9.5, R9.7) -----
+            # Values returned by ``load_runtime_config`` have already passed
+            # the runtime_config_store validation gate, so we can copy them
+            # straight onto self. Missing keys keep the in-memory defaults
+            # populated in __init__.
+            for cbbc_key in (
+                "cbbc_magnet_layer_enabled",
+                "cbbc_intraday_polling_suspended",
+                "cbbc_magnet_decay_points",
+                "cbbc_dense_band_threshold_pts",
+                "cbbc_dense_band_pull_share",
+                "cbbc_intraday_poll_interval_seconds",
+                "cbbc_magnet_direction_gate_enabled",
+                "cbbc_magnet_direction_gate_threshold",
+                "cbbc_ai_advisor_enabled",
+                "cbbc_ai_advisor_base_url",
+                "cbbc_ai_advisor_model",
+                "cbbc_ai_advisor_api_key",
+                "cbbc_ai_advisor_api_style",
+            ):
+                if cbbc_key in data:
+                    setattr(self, cbbc_key, data[cbbc_key])
             self.stop_points = self._stop_points_for_pnl(self.target_pnl)
         except Exception as e:
             print(f"[RuntimeConfig] 配置内容无效，使用默认配置: {e}")
@@ -541,6 +1429,47 @@ class HSIStrategyEngine:
             self.extreme_rsi_stop_rearm_ticks = EXTREME_RSI_STOP_REARM_TICKS
             self.bull_warrant_code = BULL_WARRANT_CODE
             self.bear_warrant_code = BEAR_WARRANT_CODE
+            # Reset CBBC fields to defaults too — keeping them out of sync
+            # with the rest of the runtime config could mask test failures.
+            self.cbbc_magnet_layer_enabled = bool(
+                CBBC_FIELD_DEFAULTS["cbbc_magnet_layer_enabled"]
+            )
+            self.cbbc_intraday_polling_suspended = bool(
+                CBBC_FIELD_DEFAULTS["cbbc_intraday_polling_suspended"]
+            )
+            self.cbbc_magnet_decay_points = float(
+                CBBC_FIELD_DEFAULTS["cbbc_magnet_decay_points"]
+            )
+            self.cbbc_dense_band_threshold_pts = float(
+                CBBC_FIELD_DEFAULTS["cbbc_dense_band_threshold_pts"]
+            )
+            self.cbbc_dense_band_pull_share = float(
+                CBBC_FIELD_DEFAULTS["cbbc_dense_band_pull_share"]
+            )
+            self.cbbc_intraday_poll_interval_seconds = float(
+                CBBC_FIELD_DEFAULTS["cbbc_intraday_poll_interval_seconds"]
+            )
+            self.cbbc_magnet_direction_gate_enabled = bool(
+                CBBC_FIELD_DEFAULTS["cbbc_magnet_direction_gate_enabled"]
+            )
+            self.cbbc_magnet_direction_gate_threshold = float(
+                CBBC_FIELD_DEFAULTS["cbbc_magnet_direction_gate_threshold"]
+            )
+            self.cbbc_ai_advisor_enabled = bool(
+                CBBC_FIELD_DEFAULTS["cbbc_ai_advisor_enabled"]
+            )
+            self.cbbc_ai_advisor_base_url = str(
+                CBBC_FIELD_DEFAULTS["cbbc_ai_advisor_base_url"]
+            )
+            self.cbbc_ai_advisor_model = str(
+                CBBC_FIELD_DEFAULTS["cbbc_ai_advisor_model"]
+            )
+            self.cbbc_ai_advisor_api_key = str(
+                CBBC_FIELD_DEFAULTS["cbbc_ai_advisor_api_key"]
+            )
+            self.cbbc_ai_advisor_api_style = str(
+                CBBC_FIELD_DEFAULTS["cbbc_ai_advisor_api_style"]
+            )
 
     async def _emit_trade_record(self, record: TradeRecord):
         original_time = record.time
@@ -1737,6 +2666,13 @@ class HSIStrategyEngine:
             ))
             return False
 
+        # CBBC 磁吸方向闸门 (UX 增强):若磁吸偏向明确指向反方向 → 阻止此次入场。
+        # 与 StatusPanel "警惕做多 / 警惕做空" 文案对齐,覆盖所有 5 类入场分支。
+        if await self._maybe_block_by_magnet_direction_gate(
+            side, hsi_price, rsi, current_time, mode
+        ):
+            return False
+
         cooldown_remaining = self._same_side_take_profit_cooldown_remaining(side)
         if cooldown_remaining > 0:
             remaining_minutes = max(1, math.ceil(cooldown_remaining / 60))
@@ -2614,6 +3550,12 @@ class HSIStrategyEngine:
 
         self.current_price = price
 
+        # Feed HSI spot into the CBBC magnet engine (cbbc-magnet-signal
+        # task 7.2). The engine also receives snapshots from CbbcDataService
+        # when wired in task 4.5; before that, this keeps the latest spot
+        # current so the adapter knows the data is fresh.
+        self._feed_cbbc_magnet_engine_hsi_spot(float(price))
+
         # 缓存指标
         self._last_rsi = round(rsi, 2) if not _is_nan(rsi) else None
         self._last_vwap = round(curr_1m["VWAP"], 2) if not _is_nan(curr_1m["VWAP"]) else None
@@ -2819,14 +3761,21 @@ class HSIStrategyEngine:
                     and self._strategy_enabled("extreme")
                     and self._extreme_branch_enabled(extreme_branch)
                 ):
-                    await self._submit_entry_order(
-                        PositionType.BULL, price, rsi, current_time, "极度超卖",
-                        extra_message=(
-                            f"{extreme_trigger_label} | RSI:{rsi:.2f} | "
-                            f"{'阳线涨' if k_change > 0 else '阴线跌'}{abs(k_change):.1f}点 | "
-                            f"{momentum_ratio:.2f}x量"
-                        ),
-                    )
+                    if not await self._maybe_apply_cbbc_magnet_veto(
+                        PositionType.BULL,
+                        float(price),
+                        float(rsi),
+                        current_time,
+                        "极度超卖",
+                    ):
+                        await self._submit_entry_order(
+                            PositionType.BULL, price, rsi, current_time, "极度超卖",
+                            extra_message=(
+                                f"{extreme_trigger_label} | RSI:{rsi:.2f} | "
+                                f"{'阳线涨' if k_change > 0 else '阴线跌'}{abs(k_change):.1f}点 | "
+                                f"{momentum_ratio:.2f}x量"
+                            ),
+                        )
 
                 elif (
                     extreme_side == PositionType.BEAR
@@ -2835,14 +3784,21 @@ class HSIStrategyEngine:
                     and self._strategy_enabled("extreme")
                     and self._extreme_branch_enabled(extreme_branch)
                 ):
-                    await self._submit_entry_order(
-                        PositionType.BEAR, price, rsi, current_time, "极度超买",
-                        extra_message=(
-                            f"{extreme_trigger_label} | RSI:{rsi:.2f} | "
-                            f"{'阳线涨' if k_change > 0 else '阴线跌'}{abs(k_change):.1f}点 | "
-                            f"{momentum_ratio:.2f}x量"
-                        ),
-                    )
+                    if not await self._maybe_apply_cbbc_magnet_veto(
+                        PositionType.BEAR,
+                        float(price),
+                        float(rsi),
+                        current_time,
+                        "极度超买",
+                    ):
+                        await self._submit_entry_order(
+                            PositionType.BEAR, price, rsi, current_time, "极度超买",
+                            extra_message=(
+                                f"{extreme_trigger_label} | RSI:{rsi:.2f} | "
+                                f"{'阳线涨' if k_change > 0 else '阴线跌'}{abs(k_change):.1f}点 | "
+                                f"{momentum_ratio:.2f}x量"
+                            ),
+                        )
 
                 elif vol_surge and k_change != 0 and not momentum_body_ok and self._strategy_enabled("momentum"):
                     print(
@@ -2918,14 +3874,21 @@ class HSIStrategyEngine:
                                 else ("极度超卖" if completed_side == PositionType.BULL else "极度超买")
                             )
                         )
-                        await self._submit_entry_order(
+                        if not await self._maybe_apply_cbbc_magnet_veto(
                             completed_side,
-                            price,
-                            rsi,
+                            float(price),
+                            float(rsi),
                             completed_kline_time,
                             completed_mode,
-                            extra_message=completed_message,
-                        )
+                        ):
+                            await self._submit_entry_order(
+                                completed_side,
+                                price,
+                                rsi,
+                                completed_kline_time,
+                                completed_mode,
+                                extra_message=completed_message,
+                            )
 
             # --- 累积趋势信号 (温水煮青蛙式单边) ---
             # 最近5根1M累积跌/涨 > 30点 + VWAP方向一致

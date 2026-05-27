@@ -1,6 +1,6 @@
 import { useEffect, useRef, useCallback, useState } from 'react';
 import type { MutableRefObject } from 'react';
-import type { WSMessage, KlineData, TradeRecord, StrategyState, TodayPnl, MarketRegime } from './types';
+import type { WSMessage, KlineData, TradeRecord, StrategyState, TodayPnl, MarketRegime, MagnetOverlayPayload, CbbcZonesPayload } from './types';
 import * as api from './api';
 
 const WS_PROTOCOL = window.location.protocol === 'https:' ? 'wss' : 'ws';
@@ -105,6 +105,8 @@ export function useWebSocket() {
   const [trades, setTrades] = useState<TradeRecord[]>(initialDataRef.current.trades);
   const [marketRegime, setMarketRegime] = useState<MarketRegime | null>(initialDataRef.current.marketRegime);
   const [todayPnl, setTodayPnl] = useState<TodayPnl | null>(null);
+  const [magnetOverlay, setMagnetOverlay] = useState<MagnetOverlayPayload | null>(null);
+  const [cbbcZones, setCbbcZones] = useState<CbbcZonesPayload | null>(null);
   const pendingRegimeRef = useRef<{ regime: string; count: number } | null>(null);
 
   const refreshTodayPnl = useCallback(async () => {
@@ -191,6 +193,12 @@ export function useWebSocket() {
           case 'state':
             setState(msg.data);
             break;
+          case 'magnet_overlay':
+            setMagnetOverlay(msg.data);
+            break;
+          case 'cbbc_zones':
+            setCbbcZones(msg.data);
+            break;
           case 'pong':
             break;
         }
@@ -244,6 +252,8 @@ export function useWebSocket() {
     setTrades([]);
     setState(null);
     setMarketRegime(null);
+    setMagnetOverlay(null);
+    setCbbcZones(null);
     pendingRegimeRef.current = null;
     try {
       window.localStorage.removeItem(STORAGE_KEY);
@@ -252,5 +262,5 @@ export function useWebSocket() {
     }
   }, []);
 
-  return { connected, state, klines, trades, marketRegime, todayPnl, clearData, refreshData, refreshTodayPnl };
+  return { connected, state, klines, trades, marketRegime, todayPnl, magnetOverlay, cbbcZones, clearData, refreshData, refreshTodayPnl };
 }

@@ -158,6 +158,10 @@ export default function ControlPanel({ isRunning, actionLoading, onConfigLoaded,
               ['掛單等待', `${config.entry_order_wait_seconds} 秒`],
               ['實盤策略', config.enabled_strategies?.length ? `${config.enabled_strategies.length} 個啟用` : '未設定'],
               ['RSI止損取消', config.extreme_rsi_stop_veto_enabled ? `開 / 硬-${config.extreme_rsi_stop_hard_ticks}格` : '關'],
+              ['CBBC 磁吸層', config.cbbc_magnet_layer_enabled ? '開' : '關'],
+              ['磁吸方向閘門', config.cbbc_magnet_direction_gate_enabled
+                ? `開 / |bias|≥${(config.cbbc_magnet_direction_gate_threshold ?? 0.15).toFixed(2)}`
+                : '關'],
               ['牛证', config.bull_warrant_code ? `${config.bull_warrant_code} ${config.bull_warrant_name || ''}` : '未设置'],
               ['熊证', config.bear_warrant_code ? `${config.bear_warrant_code} ${config.bear_warrant_name || ''}` : '未设置'],
             ].map(([label, value]) => (
@@ -253,6 +257,81 @@ export default function ControlPanel({ isRunning, actionLoading, onConfigLoaded,
           </Form.Item>
           <Form.Item label="重新武裝 (格)" name="extreme_rsi_stop_rearm_ticks" style={{ marginBottom: 10 }}>
             <InputNumber min={1} max={10} style={{ width: '100%' }} />
+          </Form.Item>
+          {/* CBBC 磁吸层 + 方向闸门 (cbbc-magnet-signal UX 增强) */}
+          <Form.Item
+            label="CBBC 磁吸层"
+            name="cbbc_magnet_layer_enabled"
+            valuePropName="checked"
+            style={{ marginBottom: 10 }}
+            tooltip="启用后,extreme 反转分支会咨询 CBBC 街货密集带是否阻止入场"
+          >
+            <Switch />
+          </Form.Item>
+          <Form.Item
+            label="磁吸方向闸门"
+            name="cbbc_magnet_direction_gate_enabled"
+            valuePropName="checked"
+            style={{ marginBottom: 10 }}
+            tooltip="启用后,|bias| 超过阈值时只准跟随磁吸方向入场:bias>0 警惕做多 → 只准 BEAR;bias<0 警惕做空 → 只准 BULL"
+          >
+            <Switch />
+          </Form.Item>
+          <Form.Item
+            label="闸门阈值 |bias|"
+            name="cbbc_magnet_direction_gate_threshold"
+            style={{ marginBottom: 10 }}
+            tooltip="|bias| 大于等于此值才触发闸门;0.15 = 中性区间 ±0.15"
+          >
+            <InputNumber min={0} max={1} step={0.05} style={{ width: '100%' }} />
+          </Form.Item>
+
+          {/* CBBC AI 决策顾问 (read-only, 不影响交易) */}
+          <Form.Item
+            label="🤖 AI 决策顾问"
+            name="cbbc_ai_advisor_enabled"
+            valuePropName="checked"
+            style={{ marginBottom: 10 }}
+            tooltip="启用后, StatusPanel 显示一个 'AI 决策建议' 卡片,可手动触发一次性请求。read-only,完全不影响交易决策。"
+          >
+            <Switch />
+          </Form.Item>
+          <Form.Item
+            label="AI base_url"
+            name="cbbc_ai_advisor_base_url"
+            style={{ marginBottom: 10 }}
+            tooltip="OpenAI 兼容端点根地址,例如本机代理 http://127.0.0.1:8765"
+          >
+            <Input placeholder="http://127.0.0.1:8765" />
+          </Form.Item>
+          <Form.Item
+            label="AI model"
+            name="cbbc_ai_advisor_model"
+            style={{ marginBottom: 10 }}
+            tooltip="模型名称 (透传给端点);用本地代理时通常忽略此字段"
+          >
+            <Input placeholder="gpt-4o-mini" />
+          </Form.Item>
+          <Form.Item
+            label="AI api_key"
+            name="cbbc_ai_advisor_api_key"
+            style={{ marginBottom: 10 }}
+            tooltip="OpenAI 兼容 Bearer Token;本机代理可填任意非空字符串"
+          >
+            <Input.Password placeholder="sk-..." visibilityToggle />
+          </Form.Item>
+          <Form.Item
+            label="AI 协议"
+            name="cbbc_ai_advisor_api_style"
+            style={{ marginBottom: 10 }}
+            tooltip="openai → /v1/chat/completions + Authorization Bearer;anthropic → /v1/messages + x-api-key"
+          >
+            <Select
+              options={[
+                { value: 'openai', label: 'OpenAI 兼容 (/v1/chat/completions)' },
+                { value: 'anthropic', label: 'Anthropic 原生 (/v1/messages)' },
+              ]}
+            />
           </Form.Item>
         </div>
         <Button

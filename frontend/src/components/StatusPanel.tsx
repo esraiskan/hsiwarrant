@@ -1,11 +1,19 @@
 import { Row, Col } from 'antd';
 import { colors } from '../theme';
-import type { StrategyState, TodayPnl } from '../types';
+import type { CbbcZonesPayload, MagnetOverlayPayload, MarketRegime, StrategyState, TodayPnl } from '../types';
+import CbbcMagnetCard from './CbbcMagnetCard';
+import CbbcZonesCard from './CbbcZonesCard';
+import CbbcAiAdvisorCard from './CbbcAiAdvisorCard';
 
 interface Props {
   state: StrategyState | null;
   connected: boolean;
   todayPnl: TodayPnl | null;
+  magnetOverlay?: MagnetOverlayPayload | null;
+  marketRegime?: MarketRegime | null;
+  cbbcZones?: CbbcZonesPayload | null;
+  /** ``cbbc_ai_advisor_enabled`` from /api/config */
+  aiAdvisorEnabled?: boolean;
 }
 
 function MetricCard({ label, value, suffix, color, size = 'normal', note }: {
@@ -42,7 +50,7 @@ function MetricCard({ label, value, suffix, color, size = 'normal', note }: {
   );
 }
 
-export default function StatusPanel({ state, connected, todayPnl }: Props) {
+export default function StatusPanel({ state, connected, todayPnl, magnetOverlay, marketRegime, cbbcZones, aiAdvisorEnabled }: Props) {
   const pos = state?.position ?? 'none';
   const posLabel = pos === 'bull' ? '🐂 牛证' : pos === 'bear' ? '🐻 熊证' : '— 空仓';
   const posColor = pos === 'bull' ? colors.bull : pos === 'bear' ? colors.bear : colors.textMuted;
@@ -126,6 +134,31 @@ export default function StatusPanel({ state, connected, todayPnl }: Props) {
             value={`${state?.win_count ?? 0}W ${state?.loss_count ?? 0}L`}
             suffix={winRate !== '—' ? `(${winRate}%)` : ''}
           />
+        </Col>
+      </Row>
+
+      {/* CBBC 磁吸面板 (cbbc-magnet-signal) */}
+      <Row gutter={[12, 12]} style={{ marginTop: 12 }}>
+        <Col xs={24} md={24} lg={24}>
+          <CbbcMagnetCard
+            state={state}
+            magnetOverlay={magnetOverlay ?? null}
+            marketRegime={marketRegime ?? null}
+          />
+        </Col>
+      </Row>
+
+      {/* CBBC 街货密集区卡 (read-only,纯展示;不参与交易决策) */}
+      <Row gutter={[12, 12]} style={{ marginTop: 12 }}>
+        <Col xs={24} md={24} lg={24}>
+          <CbbcZonesCard zones={cbbcZones ?? null} />
+        </Col>
+      </Row>
+
+      {/* CBBC AI 决策顾问卡 (read-only,纯展示;不参与交易决策) */}
+      <Row gutter={[12, 12]} style={{ marginTop: 12 }}>
+        <Col xs={24} md={24} lg={24}>
+          <CbbcAiAdvisorCard enabled={Boolean(aiAdvisorEnabled)} />
         </Col>
       </Row>
     </div>

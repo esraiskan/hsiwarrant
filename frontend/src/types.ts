@@ -65,6 +65,20 @@ export interface TradeRecord {
   message: string;
 }
 
+/** CBBC 磁吸 consult 记录（每次咨询写一条） */
+export interface MagnetConsultRecord {
+  event: 'cbbc_magnet_consult' | 'cbbc_magnet_consult_unavailable';
+  extreme_direction: 'BULL' | 'BEAR';
+  nearest_bull_distance_pts: number | null;
+  nearest_bear_distance_pts: number | null;
+  magnet_bias: number | null;
+  magnet_available: boolean;
+  magnet_aligned_against_reversal: boolean;
+  vetoed_by_cbbc_magnet: boolean;
+  reason_code: string;
+  ts_hk: string;
+}
+
 /** 策略状态 */
 export interface StrategyState {
   position: PositionType;
@@ -83,6 +97,13 @@ export interface StrategyState {
   win_count: number;
   loss_count: number;
   is_running: boolean;
+  // CBBC 磁吸信号层
+  cbbc_magnet_layer_enabled?: boolean;
+  cbbc_magnet_degraded?: boolean;
+  cbbc_magnet_bias?: number | null;
+  cbbc_nearest_bull_distance_pts?: number | null;
+  cbbc_nearest_bear_distance_pts?: number | null;
+  last_magnet_consult?: MagnetConsultRecord | null;
 }
 
 /** 策略配置 */
@@ -111,6 +132,16 @@ export interface StrategyConfig {
   extreme_rsi_stop_veto_enabled: boolean;
   extreme_rsi_stop_hard_ticks: number;
   extreme_rsi_stop_rearm_ticks: number;
+  // CBBC 磁吸方向闸门
+  cbbc_magnet_layer_enabled?: boolean;
+  cbbc_magnet_direction_gate_enabled?: boolean;
+  cbbc_magnet_direction_gate_threshold?: number;
+  // CBBC AI 决策顾问 (read-only, 不影响交易决策)
+  cbbc_ai_advisor_enabled?: boolean;
+  cbbc_ai_advisor_base_url?: string;
+  cbbc_ai_advisor_model?: string;
+  cbbc_ai_advisor_api_key?: string;
+  cbbc_ai_advisor_api_style?: 'openai' | 'anthropic';
 }
 
 /** OpenD 连接状态 */
@@ -254,6 +285,189 @@ export interface BacktestResult {
   warnings: string[];
 }
 
+/** CBBC 磁吸 overlay - 单个 Call_Level */
+export interface MagnetOverlayCallLevel {
+  code: string;
+  direction: 'bull' | 'bear';
+  call_level: number;
+  /** 发行商代码 (UB / SG / BP / JP / HSBC ...) */
+  issuer?: string;
+  /** 街货量 (股) */
+  outstanding_shares?: number;
+  /** ``|call_level - HSI|`` 在推送瞬间的距离 (pt) */
+  distance_pts?: number;
+}
+
+/** CBBC 磁吸 overlay - 5 点价格桶的 Notional 拉力 */
+export interface MagnetOverlayHistogramBucket {
+  bucket_low: number;
+  bucket_high: number;
+  pull_hkd: number;
+}
+
+/** CBBC 磁吸 overlay - 最近一次否决记录 */
+export interface MagnetOverlayVeto {
+  kline_time: string;
+  direction: 'BULL' | 'BEAR';
+  reason_code: string;
+}
+
+/** CBBC 磁吸 overlay 推送载荷（WebSocket type=magnet_overlay） */
+export interface MagnetOverlayPayload {
+  decay_points?: number;
+  dense_band_pull_share: number;
+  /** 密集带距离阈值（pt），用于前端画 spot ± threshold 的边界虚线 */
+  dense_band_threshold_pts?: number;
+  cbbc_magnet_degraded: boolean;
+  hsi_spot_stale: boolean;
+  call_levels: MagnetOverlayCallLevel[];
+  histogram: MagnetOverlayHistogramBucket[];
+  recent_vetoes: MagnetOverlayVeto[];
+}
+
+/** CBBC 街货密集区 (read-only,纯展示) - 单个 25pt 桶 */
+export interface CbbcZoneCluster {
+  bucket_low: number;
+  bucket_high: number;
+  direction: 'bull' | 'bear';
+  /** 距 spot 的点数;正 = 上方目标, 负 = 下方支撑 */
+  distance_pts: number;
+  notional_hkd: number;
+  contract_count: number;
+  outstanding_shares: number;
+  /** 桶内距 spot 最近的活合约 call_level (UI 显示的真实档位) */
+  nearest_call_level: number;
+  /** 距今日高低的安全余量 (pt) */
+  safety_margin_pts?: number | null;
+}
+
+/** 单方向操作建议 (read-only) */
+export interface CbbcTradeSetup {
+  direction: 'bull' | 'bear';
+  entry_low: number;
+  entry_high: number;
+  take_profit_1: number;
+  take_profit_2: number;
+  stop_loss: number;
+  risk_reward: number;
+  rationale: string;
+}
+
+/** ``GET /api/cbbc/zones`` + WS ``cbbc_zones`` 推送的载荷 */
+export interface CbbcZonesPayload {
+  spot: number;
+  today_low: number | null;
+  today_high: number | null;
+  bucket_pts: number;
+  targets_above: CbbcZoneCluster[];
+  supports_below: CbbcZoneCluster[];
+  live_record_count: number;
+  killed_record_count: number;
+  bull_setup?: CbbcTradeSetup | null;
+  bear_setup?: CbbcTradeSetup | null;
+}
+
+/** ``POST /api/cbbc/ai-advice`` 返回的载荷 (read-only,不影响交易) */
+export interface CbbcAiAdviceResponse {
+  ok: boolean;
+  direction?: 'bull' | 'bear' | 'skip' | null;
+  confidence?: number | null;
+  entry_low?: number | null;
+  entry_high?: number | null;
+  take_profit_1?: number | null;
+  take_profit_2?: number | null;
+  stop_loss?: number | null;
+  rationale?: string | null;
+  error?: string | null;
+  raw_model_text?: string | null;
+  model?: string | null;
+  elapsed_seconds?: number | null;
+}
+
+export interface HksiStyleEntryPlan {
+  condition: string;
+  action: '買升' | '買跌' | '不做';
+  amount: number;
+}
+
+export interface HksiStyleTradePlan {
+  main_direction: string;
+  status: '空倉等待' | '持倉觀察' | '等待確認' | '不交易';
+  entry_plan_1: HksiStyleEntryPlan;
+  entry_plan_2: HksiStyleEntryPlan;
+  stop_loss: string[];
+  take_profit: string[];
+  give_up_conditions: string[];
+  product_warning: string;
+  summary: string;
+}
+
+export interface HksiStyleExecutionEntryRule {
+  label: string;
+  action: 'buy_bull' | 'buy_bear' | 'none';
+  price_min: number;
+  price_max: number;
+  rsi_min: number;
+  rsi_max: number;
+  vwap_relation: 'any' | 'above' | 'below';
+  amount: number;
+  priority: number;
+  comment: string;
+}
+
+export interface HksiStyleExecutionPlan {
+  enabled: boolean;
+  side: 'bull' | 'bear' | 'none';
+  entry_rules: HksiStyleExecutionEntryRule[];
+  take_profit_levels: number[];
+  stop_loss_levels: number[];
+  give_up_levels: number[];
+  max_position_hkd: number;
+  time_in_force: string;
+  notes: string;
+}
+
+export interface HksiStyleTradeCoefficients {
+  direction: 'UP' | 'DOWN' | 'NEUTRAL';
+  entry_min: number;
+  entry_max: number;
+  share_count: number;
+  take_profit_min: number;
+  take_profit_max: number;
+  stop_loss_min: number;
+  stop_loss_max: number;
+  confidence: number;
+  notes: string;
+}
+
+export interface HksiStyleAiReview {
+  summary: string;
+  trade_plan: HksiStyleTradePlan;
+  execution_plan: HksiStyleExecutionPlan;
+  trade_coefficients: HksiStyleTradeCoefficients;
+  risk_level: 'low' | 'medium' | 'high';
+  confidence_comment: string;
+  key_supporting_points: string[];
+  conflicts: string[];
+  watch_levels: string[];
+  data_quality_notes: string[];
+  suggested_user_action: string;
+  actionability: 'observe' | 'wait_for_confirmation' | 'reduce_size' | 'avoid_trade';
+  limitations: string[];
+}
+
+export interface HksiStyleAiAdviceResponse {
+  ok: boolean;
+  generated_at: string;
+  source: string;
+  model?: string | null;
+  review?: HksiStyleAiReview | null;
+  context?: Record<string, unknown>;
+  error?: string | null;
+  raw_model_text?: string | null;
+  elapsed_seconds?: number | null;
+}
+
 /** WebSocket 消息 */
 export type WSMessage =
   | { type: 'kline'; data: KlineData }
@@ -261,4 +475,6 @@ export type WSMessage =
   | { type: 'market_regime'; data: MarketRegime }
   | { type: 'trade'; data: TradeRecord }
   | { type: 'state'; data: StrategyState }
+  | { type: 'magnet_overlay'; data: MagnetOverlayPayload }
+  | { type: 'cbbc_zones'; data: CbbcZonesPayload }
   | { type: 'pong' };
